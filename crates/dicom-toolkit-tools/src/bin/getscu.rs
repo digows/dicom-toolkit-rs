@@ -14,7 +14,7 @@ use dicom_toolkit_data::{DicomWriter, FileFormat, FileMetaInformation};
 use dicom_toolkit_net::{c_get, Association, AssociationConfig, GetRequest, ReceivedInstance};
 use dicom_toolkit_tools::query_retrieve::{
     accepted_transfer_syntax, build_query, decode_dataset_with_fallback, print_dataset,
-    qr_get_contexts, select_accepted_context, TS_EXPLICIT_VR_LE,
+    qr_get_contexts, qr_get_role_selections, select_accepted_context, TS_EXPLICIT_VR_LE,
 };
 
 #[derive(Parser)]
@@ -92,6 +92,7 @@ async fn main() {
     let contexts = qr_get_contexts();
     let config = AssociationConfig {
         local_ae_title: args.aetitle.clone(),
+        requested_role_selections: qr_get_role_selections(),
         ..Default::default()
     };
 

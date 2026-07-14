@@ -3,13 +3,19 @@
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, DataSet};
 use dicom_toolkit_dict::{tags, Vr};
+use futures_util::StreamExt;
+use tracing::warn;
 
 use crate::association::Association;
 use crate::config::AssociationConfig;
 use crate::presentation::PresentationContextRq;
-use crate::services::provider::{DestinationLookup, MoveEvent, MoveServiceProvider};
+use crate::services::provider::{
+    DestinationLookup, MoveEvent, MoveServiceProvider, STATUS_DATASET_MISMATCH, STATUS_SUCCESS,
+    STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS, STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
+};
 use crate::services::recv_command_data_bytes;
 use crate::services::store::c_store;
+use crate::services::SubOperationCounts;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -132,6 +138,7 @@ pub async fn handle_move_rq<P, L>(
     provider: &P,
     dest_lookup: &L,
     local_ae: &str,
+    association_config: &AssociationConfig,
 ) -> DcmResult<()>
 where
     P: MoveServiceProvider,
@@ -156,9 +163,21 @@ where
         .map(|pc| pc.transfer_syntax.trim_end_matches('\0').to_string())
         .unwrap_or_else(|| TS_EXPLICIT_LE.to_string());
 
-    let identifier = DicomReader::new(query_bytes.as_slice())
-        .read_dataset(&ts)
-        .unwrap_or_else(|_| DataSet::new());
+    let identifier = match DicomReader::new(query_bytes.as_slice()).read_dataset(&ts) {
+        Ok(identifier) => identifier,
+        Err(error) => {
+            warn!(%error, "failed to decode C-MOVE identifier");
+            return send_final_response(
+                assoc,
+                ctx_id,
+                &sop_class,
+                msg_id,
+                STATUS_DATASET_MISMATCH,
+                SubOperationCounts::default(),
+            )
+            .await;
+        }
+    };
 
     // Resolve destination AE title.
     let dest_addr = match dest_lookup.lookup(&destination) {
@@ -181,123 +200,235 @@ where
         identifier,
     };
 
-    let items = provider.on_move(event).await;
+    let plan = match provider.on_move(event).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(%error, "C-MOVE provider failed before producing a retrieval plan");
+            return send_final_response(
+                assoc,
+                ctx_id,
+                &sop_class,
+                msg_id,
+                STATUS_UNABLE_TO_PROCESS,
+                SubOperationCounts::default(),
+            )
+            .await;
+        }
+    };
+    let (total, storage_contexts, mut items) = plan.into_parts();
 
-    if items.is_empty() {
-        // Nothing to move — send final success immediately.
-        let mut rsp = DataSet::new();
-        rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
-        rsp.set_u16(tags::COMMAND_FIELD, 0x8021);
-        rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
-        rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101);
-        rsp.set_u16(tags::STATUS, 0x0000);
-        rsp.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, 0);
-        rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, 0);
-        rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, 0);
-        rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, 0);
-        return assoc.send_dimse_command(ctx_id, &rsp).await;
+    if total == 0 {
+        return send_final_response(
+            assoc,
+            ctx_id,
+            &sop_class,
+            msg_id,
+            STATUS_SUCCESS,
+            SubOperationCounts::default(),
+        )
+        .await;
     }
 
-    // Collect unique SOP class UIDs to build presentation contexts.
-    let mut unique_sop_classes: Vec<String> = items
+    let declared_contexts = storage_contexts
         .iter()
-        .map(|i| i.sop_class_uid.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    unique_sop_classes.sort();
+        .map(|context| {
+            (
+                context.sop_class_uid.clone(),
+                context.transfer_syntax_uid.clone(),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
 
-    let sub_contexts: Vec<PresentationContextRq> = unique_sop_classes
+    let sub_contexts: Vec<PresentationContextRq> = storage_contexts
         .iter()
         .enumerate()
-        .map(|(i, sc)| PresentationContextRq {
-            id: (i * 2 + 1) as u8,
-            abstract_syntax: sc.clone(),
-            transfer_syntaxes: vec![TS_EXPLICIT_LE.to_string()],
+        .map(|(index, context)| PresentationContextRq {
+            id: (index * 2 + 1) as u8,
+            abstract_syntax: context.sop_class_uid.clone(),
+            transfer_syntaxes: vec![context.transfer_syntax_uid.clone()],
         })
         .collect();
 
-    let sub_cfg = AssociationConfig {
-        local_ae_title: local_ae.to_string(),
-        accept_all_transfer_syntaxes: true,
-        ..Default::default()
+    let mut sub_config = association_config.clone();
+    sub_config.local_ae_title = local_ae.to_string();
+
+    let mut sub_assoc = match Association::request(
+        &dest_addr,
+        &destination,
+        local_ae,
+        &sub_contexts,
+        &sub_config,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(error) => {
+            warn!(%error, destination = %destination, "C-MOVE destination association failed");
+            return send_final_response(
+                assoc,
+                ctx_id,
+                &sop_class,
+                msg_id,
+                STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
+                SubOperationCounts {
+                    remaining: 0,
+                    completed: 0,
+                    failed: total,
+                    warning: 0,
+                },
+            )
+            .await;
+        }
     };
 
-    let mut sub_assoc =
-        match Association::request(&dest_addr, &destination, local_ae, &sub_contexts, &sub_cfg)
-            .await
-        {
-            Ok(a) => a,
-            Err(_) => {
-                // Could not open sub-association — report all as failed.
-                let total = items.len() as u16;
-                let mut rsp = DataSet::new();
-                rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
-                rsp.set_u16(tags::COMMAND_FIELD, 0x8021);
-                rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
-                rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101);
-                rsp.set_u16(tags::STATUS, 0xA801);
-                rsp.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, 0);
-                rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, 0);
-                rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, total);
-                rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, 0);
-                return assoc.send_dimse_command(ctx_id, &rsp).await;
+    let mut completed: u16 = 0;
+    let mut failed: u16 = 0;
+    let mut warning: u16 = 0;
+    let mut provider_failed = false;
+
+    while let Some(result) = items.next().await {
+        if completed.saturating_add(failed).saturating_add(warning) >= total {
+            warn!(total, "C-MOVE provider yielded more items than declared");
+            provider_failed = true;
+            break;
+        }
+
+        let item = match result {
+            Ok(item) => item,
+            Err(error) => {
+                warn!(%error, "C-MOVE retrieval stream failed");
+                failed = total.saturating_sub(completed.saturating_add(warning));
+                provider_failed = true;
+                break;
             }
         };
 
-    let total = items.len() as u16;
-    let mut completed: u16 = 0;
-    let mut failed: u16 = 0;
+        let context_key = (item.sop_class_uid.clone(), item.transfer_syntax_uid.clone());
 
-    for item in &items {
-        let remaining = total.saturating_sub(completed + failed + 1);
-
-        if let Some(store_ctx) = sub_assoc.find_context(&item.sop_class_uid) {
+        if let Some(store_context_id) = declared_contexts
+            .contains(&context_key)
+            .then(|| {
+                sub_assoc
+                    .find_context_for_scu_with_transfer_syntax(
+                        &item.sop_class_uid,
+                        &item.transfer_syntax_uid,
+                    )
+                    .map(|context| context.id)
+            })
+            .flatten()
+        {
             use crate::services::store::StoreRequest;
             let req = StoreRequest {
-                sop_class_uid: item.sop_class_uid.clone(),
-                sop_instance_uid: item.sop_instance_uid.clone(),
+                sop_class_uid: item.sop_class_uid,
+                sop_instance_uid: item.sop_instance_uid,
                 priority: 0,
-                dataset_bytes: item.dataset.clone(),
-                context_id: store_ctx.id,
+                dataset: item.dataset,
+                context_id: store_context_id,
             };
             match c_store(&mut sub_assoc, req).await {
-                Ok(rsp) if rsp.status == 0x0000 => completed += 1,
+                Ok(response) if response.status == STATUS_SUCCESS => completed += 1,
+                Ok(response) if is_warning_status(response.status) => warning += 1,
                 _ => failed += 1,
             }
         } else {
             failed += 1;
         }
 
-        // Send pending C-MOVE-RSP.
-        let mut pending_rsp = DataSet::new();
-        pending_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
-        pending_rsp.set_u16(tags::COMMAND_FIELD, 0x8021); // C-MOVE-RSP
-        pending_rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
-        pending_rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101); // no dataset
-        pending_rsp.set_u16(tags::STATUS, 0xFF00); // pending
-        pending_rsp.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, remaining);
-        pending_rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, completed);
-        pending_rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, failed);
-        pending_rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, 0);
-        assoc.send_dimse_command(ctx_id, &pending_rsp).await?;
+        let remaining =
+            total.saturating_sub(completed.saturating_add(failed).saturating_add(warning));
+        send_pending_response(
+            assoc,
+            &sop_class,
+            ctx_id,
+            msg_id,
+            SubOperationCounts {
+                remaining,
+                completed,
+                failed,
+                warning,
+            },
+        )
+        .await?;
     }
 
     let _ = sub_assoc.release().await;
 
-    let final_status: u16 = if failed > 0 { 0xB000 } else { 0x0000 };
+    let accounted = completed.saturating_add(failed).saturating_add(warning);
+    if accounted < total {
+        failed = failed.saturating_add(total - accounted);
+        provider_failed = true;
+        warn!(
+            total,
+            completed, failed, warning, "C-MOVE provider stream ended early"
+        );
+    }
 
+    let final_status = if provider_failed || (failed > 0 && completed == 0 && warning == 0) {
+        STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS
+    } else if failed > 0 || warning > 0 {
+        STATUS_WARNING
+    } else {
+        STATUS_SUCCESS
+    };
+
+    send_final_response(
+        assoc,
+        ctx_id,
+        &sop_class,
+        msg_id,
+        final_status,
+        SubOperationCounts {
+            remaining: 0,
+            completed,
+            failed,
+            warning,
+        },
+    )
+    .await
+}
+
+async fn send_pending_response(
+    assoc: &mut Association,
+    sop_class: &str,
+    ctx_id: u8,
+    msg_id: u16,
+    counts: SubOperationCounts,
+) -> DcmResult<()> {
+    let mut response = DataSet::new();
+    response.set_uid(tags::AFFECTED_SOP_CLASS_UID, sop_class);
+    response.set_u16(tags::COMMAND_FIELD, 0x8021);
+    response.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
+    response.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101);
+    response.set_u16(tags::STATUS, 0xFF00);
+    response.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, counts.remaining);
+    response.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, counts.completed);
+    response.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, counts.failed);
+    response.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, counts.warning);
+    assoc.send_dimse_command(ctx_id, &response).await
+}
+
+async fn send_final_response(
+    assoc: &mut Association,
+    ctx_id: u8,
+    sop_class: &str,
+    msg_id: u16,
+    status: u16,
+    counts: SubOperationCounts,
+) -> DcmResult<()> {
     let mut final_rsp = DataSet::new();
-    final_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
-    final_rsp.set_u16(tags::COMMAND_FIELD, 0x8021); // C-MOVE-RSP
+    final_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, sop_class);
+    final_rsp.set_u16(tags::COMMAND_FIELD, 0x8021);
     final_rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
-    final_rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101); // no dataset
-    final_rsp.set_u16(tags::STATUS, final_status);
-    final_rsp.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, 0);
-    final_rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, completed);
-    final_rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, failed);
-    final_rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, 0);
+    final_rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101);
+    final_rsp.set_u16(tags::STATUS, status);
+    final_rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, counts.completed);
+    final_rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, counts.failed);
+    final_rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, counts.warning);
     assoc.send_dimse_command(ctx_id, &final_rsp).await
+}
+
+fn is_warning_status(status: u16) -> bool {
+    status == 0x0001 || status & 0xF000 == 0xB000
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

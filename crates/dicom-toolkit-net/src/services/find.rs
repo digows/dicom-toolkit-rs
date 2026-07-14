@@ -3,9 +3,14 @@
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, io::writer::DicomWriter, DataSet};
 use dicom_toolkit_dict::tags;
+use futures_util::StreamExt;
+use tracing::warn;
 
 use crate::association::Association;
-use crate::services::provider::{FindEvent, FindServiceProvider};
+use crate::services::provider::{
+    FindEvent, FindServiceProvider, STATUS_DATASET_MISMATCH, STATUS_SUCCESS,
+    STATUS_UNABLE_TO_PROCESS,
+};
 use crate::services::recv_command_data_bytes;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -124,9 +129,14 @@ where
         .map(|pc| pc.transfer_syntax.trim_end_matches('\0').to_string())
         .unwrap_or_else(|| TS_EXPLICIT_LE.to_string());
 
-    let identifier = DicomReader::new(query_bytes.as_slice())
-        .read_dataset(&negotiated_ts)
-        .unwrap_or_else(|_| DataSet::new());
+    let identifier = match DicomReader::new(query_bytes.as_slice()).read_dataset(&negotiated_ts) {
+        Ok(identifier) => identifier,
+        Err(error) => {
+            warn!(%error, "failed to decode C-FIND identifier");
+            return send_final_response(assoc, ctx_id, &sop_class, msg_id, STATUS_DATASET_MISMATCH)
+                .await;
+        }
+    };
 
     let event = FindEvent {
         calling_ae: assoc.calling_ae.clone(),
@@ -134,11 +144,51 @@ where
         identifier,
     };
 
-    let matches = provider.on_find(event).await;
+    let mut matches = match provider.on_find(event).await {
+        Ok(matches) => matches,
+        Err(error) => {
+            warn!(%error, "C-FIND provider failed before producing results");
+            return send_final_response(
+                assoc,
+                ctx_id,
+                &sop_class,
+                msg_id,
+                STATUS_UNABLE_TO_PROCESS,
+            )
+            .await;
+        }
+    };
 
     // Send one pending RSP per match.
-    for result_ds in &matches {
-        let result_bytes = encode_dataset(result_ds, &negotiated_ts)?;
+    while let Some(result) = matches.next().await {
+        let result_ds = match result {
+            Ok(result_ds) => result_ds,
+            Err(error) => {
+                warn!(%error, "C-FIND result stream failed");
+                return send_final_response(
+                    assoc,
+                    ctx_id,
+                    &sop_class,
+                    msg_id,
+                    STATUS_UNABLE_TO_PROCESS,
+                )
+                .await;
+            }
+        };
+        let result_bytes = match encode_dataset(&result_ds, &negotiated_ts) {
+            Ok(result_bytes) => result_bytes,
+            Err(error) => {
+                warn!(%error, "failed to encode C-FIND result");
+                return send_final_response(
+                    assoc,
+                    ctx_id,
+                    &sop_class,
+                    msg_id,
+                    STATUS_UNABLE_TO_PROCESS,
+                )
+                .await;
+            }
+        };
 
         let mut rsp = DataSet::new();
         rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
@@ -151,13 +201,22 @@ where
         assoc.send_dimse_data(ctx_id, &result_bytes).await?;
     }
 
-    // Send final success response (no dataset).
+    send_final_response(assoc, ctx_id, &sop_class, msg_id, STATUS_SUCCESS).await
+}
+
+async fn send_final_response(
+    assoc: &mut Association,
+    ctx_id: u8,
+    sop_class: &str,
+    msg_id: u16,
+    status: u16,
+) -> DcmResult<()> {
     let mut final_rsp = DataSet::new();
-    final_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
+    final_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, sop_class);
     final_rsp.set_u16(tags::COMMAND_FIELD, 0x8020); // C-FIND-RSP
     final_rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
     final_rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101); // no dataset
-    final_rsp.set_u16(tags::STATUS, 0x0000); // success
+    final_rsp.set_u16(tags::STATUS, status);
 
     assoc.send_dimse_command(ctx_id, &final_rsp).await
 }
