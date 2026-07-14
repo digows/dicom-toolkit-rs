@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-codec"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "dicom-toolkit-core",
  "dicom-toolkit-data",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-core"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "crc32fast",
  "encoding_rs",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-data"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "base64",
  "bytes",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-dict"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "dicom-toolkit-core",
  "proptest",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-image"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "dicom-toolkit-core",
  "dicom-toolkit-data",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-jpeg2000"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "dicom-toolkit-data",
  "dicom-toolkit-dict",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-net"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "bytes",
  "dicom-toolkit-core",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "dicom-toolkit-tools"
-version = "0.5.0"
+version = "0.6.0-rc.1"
 dependencies = [
  "clap",
  "dicom-toolkit-codec",
