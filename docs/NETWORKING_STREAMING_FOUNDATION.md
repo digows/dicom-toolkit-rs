@@ -83,8 +83,8 @@ requires a semver-compatible breaking release before publication:
 
 `Vec<u8>` and `Bytes` convert directly into `DatasetSource`, while
 `find_responses` and `RetrievePlan::from_items` are migration conveniences for
-small in-memory workloads. The workspace is still marked `0.5.0`; release
-versioning and publication metadata must be decided before publishing the fork.
+small in-memory workloads. These breaking networking contracts are first
+available in the `0.6.0-rc.1` workspace release candidate.
 
 ## Transfer syntax and roles
 
