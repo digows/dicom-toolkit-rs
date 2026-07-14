@@ -7,6 +7,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
+use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_core::uid::sop_class;
 use dicom_toolkit_data::io::{reader::DicomReader, writer::DicomWriter};
 use dicom_toolkit_data::DataSet;
@@ -20,8 +21,9 @@ use dicom_toolkit_net::services::get::GetRequest;
 use dicom_toolkit_net::services::r#move::MoveRequest;
 use dicom_toolkit_net::services::store::StoreRequest;
 use dicom_toolkit_net::{
-    c_echo, c_find, c_get, c_move, c_store, Association, FindEvent, FindServiceProvider, GetEvent,
-    GetServiceProvider, MoveEvent, MoveServiceProvider, RetrieveItem, StaticDestinationLookup,
+    c_echo, c_find, c_get, c_move, c_store, find_responses, Association, FindEvent,
+    FindResponseStream, FindServiceProvider, GetEvent, GetServiceProvider, MoveEvent,
+    MoveServiceProvider, RetrieveItem, RetrievePlan, ScpScuRoleSelection, StaticDestinationLookup,
     StoreEvent, StoreResult, StoreServiceProvider, STATUS_SUCCESS,
 };
 
@@ -141,8 +143,8 @@ struct FixedFindProvider {
 }
 
 impl FindServiceProvider for FixedFindProvider {
-    async fn on_find(&self, _event: FindEvent) -> Vec<DataSet> {
-        self.results.clone()
+    async fn on_find(&self, _event: FindEvent) -> DcmResult<FindResponseStream> {
+        Ok(find_responses(self.results.clone()))
     }
 }
 
@@ -152,8 +154,8 @@ struct FixedGetProvider {
 }
 
 impl GetServiceProvider for FixedGetProvider {
-    async fn on_get(&self, _event: GetEvent) -> Vec<RetrieveItem> {
-        self.items.clone()
+    async fn on_get(&self, _event: GetEvent) -> DcmResult<RetrievePlan> {
+        RetrievePlan::from_items(self.items.clone())
     }
 }
 
@@ -163,8 +165,8 @@ struct FixedMoveProvider {
 }
 
 impl MoveServiceProvider for FixedMoveProvider {
-    async fn on_move(&self, _event: MoveEvent) -> Vec<RetrieveItem> {
-        self.items.clone()
+    async fn on_move(&self, _event: MoveEvent) -> DcmResult<RetrievePlan> {
+        RetrievePlan::from_items(self.items.clone())
     }
 }
 
@@ -241,7 +243,7 @@ async fn test_server_store_loopback() {
             sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
             sop_instance_uid: "1.2.3.server.store.1".to_string(),
             priority: 0,
-            dataset_bytes: encode_dataset(&ds),
+            dataset: encode_dataset(&ds).into(),
             context_id: ctx_id,
         },
     )
@@ -402,7 +404,7 @@ async fn test_server_find_loopback_implicit_vr_le() {
 /// C-GET from a DicomServer — instances delivered via sub-ops on same association.
 #[tokio::test]
 async fn test_server_get_loopback() {
-    let inst_ds = make_ct_dataset("1.2.3.server.get.1", "Patient^Get");
+    let inst_ds = make_ct_dataset("1.2.3.1001", "Patient^Get");
     let inst_bytes = encode_dataset(&inst_ds);
 
     let server = DicomServer::builder()
@@ -411,8 +413,9 @@ async fn test_server_get_loopback() {
         .get_provider(FixedGetProvider {
             items: vec![RetrieveItem {
                 sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
-                sop_instance_uid: "1.2.3.server.get.1".to_string(),
-                dataset: inst_bytes,
+                sop_instance_uid: "1.2.3.1001".to_string(),
+                transfer_syntax_uid: TS_EXPLICIT_LE.to_string(),
+                dataset: inst_bytes.into(),
             }],
         })
         .build()
@@ -424,7 +427,12 @@ async fn test_server_get_loopback() {
 
     tokio::spawn(async move { server.run().await });
 
-    let cfg = scu_config();
+    let mut cfg = scu_config();
+    cfg.requested_role_selections = vec![ScpScuRoleSelection {
+        sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+        scu_role: false,
+        scp_role: true,
+    }];
     let mut assoc = Association::request(
         &addr.to_string(),
         "GETSCP",
@@ -462,7 +470,7 @@ async fn test_server_get_loopback() {
     token.cancel();
 
     assert_eq!(result.instances.len(), 1, "expected 1 instance received");
-    assert_eq!(result.instances[0].sop_instance_uid, "1.2.3.server.get.1");
+    assert_eq!(result.instances[0].sop_instance_uid, "1.2.3.1001");
     assert_eq!(
         result.instances[0]
             .transfer_syntax_uid
@@ -496,7 +504,7 @@ async fn test_server_move_loopback() {
     tokio::spawn(async move { storage_server.run().await });
 
     // QR SCP that will move to STORESCP.
-    let inst_ds = make_ct_dataset("1.2.3.server.move.1", "Patient^Move");
+    let inst_ds = make_ct_dataset("1.2.3.1002", "Patient^Move");
     let inst_bytes = encode_dataset(&inst_ds);
 
     let dest_lookup =
@@ -508,8 +516,9 @@ async fn test_server_move_loopback() {
         .move_provider(FixedMoveProvider {
             items: vec![RetrieveItem {
                 sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
-                sop_instance_uid: "1.2.3.server.move.1".to_string(),
-                dataset: inst_bytes,
+                sop_instance_uid: "1.2.3.1002".to_string(),
+                transfer_syntax_uid: TS_EXPLICIT_LE.to_string(),
+                dataset: inst_bytes.into(),
             }],
         })
         .move_destination_lookup(dest_lookup)
@@ -572,7 +581,7 @@ async fn test_server_move_loopback() {
 
     let stored = storage_check.stored.lock().unwrap();
     assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].1, "1.2.3.server.move.1");
+    assert_eq!(stored[0].1, "1.2.3.1002");
 
     qr_token.cancel();
     storage_token.cancel();
@@ -625,7 +634,7 @@ async fn test_server_concurrent_associations() {
                     sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
                     sop_instance_uid: format!("1.2.3.concurrent.{i}"),
                     priority: 0,
-                    dataset_bytes: encode_dataset(&ds),
+                    dataset: encode_dataset(&ds).into(),
                     context_id: ctx_id,
                 },
             )
@@ -687,4 +696,32 @@ async fn test_server_graceful_shutdown() {
         connect_result.is_err(),
         "connection after shutdown should fail"
     );
+}
+
+#[tokio::test]
+async fn test_server_aborts_idle_association_after_shutdown_deadline() {
+    let server = DicomServer::builder()
+        .ae_title("SHUTDOWNSCP")
+        .port(0)
+        .graceful_shutdown_timeout(std::time::Duration::from_millis(20))
+        .build()
+        .await
+        .expect("build server");
+    let address = loopback_addr(server.local_addr().expect("local addr"));
+    let cancellation_token = server.cancellation_token();
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    let idle_connection = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect idle client");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    cancellation_token.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), server_task)
+        .await
+        .expect("server exceeded shutdown deadline")
+        .expect("server task panicked");
+
+    drop(idle_connection);
+    assert!(result.is_ok());
 }

@@ -106,6 +106,10 @@ pub enum DcmError {
     #[error("no accepted presentation context for SOP class {sop_class_uid}")]
     NoPresentationContext { sop_class_uid: String },
 
+    /// A received DICOM Upper Layer PDU exceeded the configured resource limit.
+    #[error("PDU length {length} exceeds the configured maximum of {maximum} bytes")]
+    PduLengthExceeded { length: u32, maximum: u32 },
+
     // ── TLS ──────────────────────────────────────────────────────────────
     /// TLS handshake or transport error.
     #[error("TLS error: {reason}")]

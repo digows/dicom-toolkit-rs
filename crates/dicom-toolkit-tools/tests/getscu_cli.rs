@@ -3,10 +3,11 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_core::uid::sop_class;
 use dicom_toolkit_data::{DataSet, DicomWriter, FileFormat};
 use dicom_toolkit_dict::{tags, Vr};
-use dicom_toolkit_net::{DicomServer, GetEvent, GetServiceProvider, RetrieveItem};
+use dicom_toolkit_net::{DicomServer, GetEvent, GetServiceProvider, RetrieveItem, RetrievePlan};
 
 const TS_EXPLICIT_LE: &str = "1.2.840.10008.1.2.1";
 
@@ -44,8 +45,8 @@ struct FixedGetProvider {
 }
 
 impl GetServiceProvider for FixedGetProvider {
-    async fn on_get(&self, _event: GetEvent) -> Vec<RetrieveItem> {
-        self.items.clone()
+    async fn on_get(&self, _event: GetEvent) -> DcmResult<RetrievePlan> {
+        RetrievePlan::from_items(self.items.clone())
     }
 }
 
@@ -62,7 +63,8 @@ async fn getscu_retrieves_and_saves_instances() {
             items: vec![RetrieveItem {
                 sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
                 sop_instance_uid: "1.2.3.4.5.6".to_string(),
-                dataset: inst_bytes,
+                transfer_syntax_uid: TS_EXPLICIT_LE.to_string(),
+                dataset: inst_bytes.into(),
             }],
         })
         .build()

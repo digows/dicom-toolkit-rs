@@ -3,10 +3,16 @@
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, DataSet};
 use dicom_toolkit_dict::tags;
+use futures_util::StreamExt;
+use tracing::warn;
 
 use crate::association::Association;
-use crate::services::provider::{GetEvent, GetServiceProvider};
+use crate::services::provider::{
+    GetEvent, GetServiceProvider, STATUS_DATASET_MISMATCH, STATUS_SUCCESS,
+    STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS, STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
+};
 use crate::services::recv_command_data_bytes;
+use crate::services::SubOperationCounts;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -123,6 +129,16 @@ pub async fn c_get(assoc: &mut Association, req: GetRequest) -> DcmResult<GetRes
                     .map(|pc| pc.transfer_syntax.trim_end_matches('\0').to_string())
                     .unwrap_or_else(|| TS_EXPLICIT_LE.to_string());
 
+                let valid_storage_context = assoc
+                    .context_by_id(ctx_id)
+                    .is_some_and(|context| context.abstract_syntax == sop_class)
+                    && assoc.local_scp_role(&sop_class);
+                if !valid_storage_context {
+                    return Err(dicom_toolkit_core::error::DcmError::NoPresentationContext {
+                        sop_class_uid: sop_class,
+                    });
+                }
+
                 let data = assoc.recv_dimse_data().await?;
                 instances.push(ReceivedInstance {
                     sop_class_uid: sop_class.clone(),
@@ -228,9 +244,21 @@ where
         .map(|pc| pc.transfer_syntax.trim_end_matches('\0').to_string())
         .unwrap_or_else(|| TS_EXPLICIT_LE.to_string());
 
-    let identifier = DicomReader::new(query_bytes.as_slice())
-        .read_dataset(&ts)
-        .unwrap_or_else(|_| DataSet::new());
+    let identifier = match DicomReader::new(query_bytes.as_slice()).read_dataset(&ts) {
+        Ok(identifier) => identifier,
+        Err(error) => {
+            warn!(%error, "failed to decode C-GET identifier");
+            return send_final_response(
+                assoc,
+                ctx_id,
+                &sop_class,
+                msg_id,
+                STATUS_DATASET_MISMATCH,
+                SubOperationCounts::default(),
+            )
+            .await;
+        }
+    };
 
     let event = GetEvent {
         calling_ae: assoc.calling_ae.clone(),
@@ -238,16 +266,62 @@ where
         identifier,
     };
 
-    let items = provider.on_get(event).await;
-    let total = items.len() as u16;
+    let plan = match provider.on_get(event).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(%error, "C-GET provider failed before producing a retrieval plan");
+            return send_final_response(
+                assoc,
+                ctx_id,
+                &sop_class,
+                msg_id,
+                STATUS_UNABLE_TO_PROCESS,
+                SubOperationCounts::default(),
+            )
+            .await;
+        }
+    };
+    let (total, declared_contexts, mut items) = plan.into_parts();
+    let declared_contexts = declared_contexts
+        .into_iter()
+        .map(|context| (context.sop_class_uid, context.transfer_syntax_uid))
+        .collect::<std::collections::HashSet<_>>();
     let mut completed: u16 = 0;
     let mut failed: u16 = 0;
+    let mut warning: u16 = 0;
+    let mut provider_failed = false;
 
-    for item in &items {
-        let remaining = total.saturating_sub(completed + failed + 1);
+    while let Some(result) = items.next().await {
+        if completed.saturating_add(failed).saturating_add(warning) >= total {
+            warn!(total, "C-GET provider yielded more items than declared");
+            provider_failed = true;
+            break;
+        }
+
+        let item = match result {
+            Ok(item) => item,
+            Err(error) => {
+                warn!(%error, "C-GET retrieval stream failed");
+                failed = total.saturating_sub(completed.saturating_add(warning));
+                provider_failed = true;
+                break;
+            }
+        };
+
+        let context_key = (item.sop_class_uid.clone(), item.transfer_syntax_uid.clone());
 
         // Find a suitable presentation context for the SOP class.
-        let store_ctx = assoc.find_context(&item.sop_class_uid).map(|pc| pc.id);
+        let store_ctx = declared_contexts
+            .contains(&context_key)
+            .then(|| {
+                assoc
+                    .find_context_for_scu_with_transfer_syntax(
+                        &item.sop_class_uid,
+                        &item.transfer_syntax_uid,
+                    )
+                    .map(|pc| pc.id)
+            })
+            .flatten();
 
         if let Some(store_ctx_id) = store_ctx {
             let sub_msg_id = next_message_id();
@@ -261,47 +335,131 @@ where
             store_rq.set_uid(tags::AFFECTED_SOP_INSTANCE_UID, &item.sop_instance_uid);
 
             assoc.send_dimse_command(store_ctx_id, &store_rq).await?;
-            assoc.send_dimse_data(store_ctx_id, &item.dataset).await?;
+            assoc
+                .send_dimse_data_source(store_ctx_id, &item.dataset)
+                .await?;
 
             // Wait for C-STORE-RSP from SCU.
             let (_rsp_ctx, store_rsp) = assoc.recv_dimse_command().await?;
             let store_status = store_rsp.get_u16(tags::STATUS).unwrap_or(0xFFFF);
-            if store_status == 0x0000 {
+            let response_message_id = store_rsp
+                .get_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO)
+                .unwrap_or(0);
+            let response_command = store_rsp.get_u16(tags::COMMAND_FIELD).unwrap_or(0);
+            if store_status == STATUS_SUCCESS
+                && response_message_id == sub_msg_id
+                && response_command == 0x8001
+            {
                 completed += 1;
+            } else if is_warning_status(store_status)
+                && response_message_id == sub_msg_id
+                && response_command == 0x8001
+            {
+                warning += 1;
             } else {
                 failed += 1;
             }
-
-            // Send pending C-GET-RSP with updated counts.
-            let mut pending_rsp = DataSet::new();
-            pending_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
-            pending_rsp.set_u16(tags::COMMAND_FIELD, 0x8010); // C-GET-RSP
-            pending_rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
-            pending_rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101); // no dataset
-            pending_rsp.set_u16(tags::STATUS, 0xFF00); // pending
-            pending_rsp.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, remaining);
-            pending_rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, completed);
-            pending_rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, failed);
-            pending_rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, 0);
-            assoc.send_dimse_command(ctx_id, &pending_rsp).await?;
         } else {
             failed += 1;
         }
+
+        let remaining =
+            total.saturating_sub(completed.saturating_add(failed).saturating_add(warning));
+        send_pending_response(
+            assoc,
+            &sop_class,
+            ctx_id,
+            msg_id,
+            SubOperationCounts {
+                remaining,
+                completed,
+                failed,
+                warning,
+            },
+        )
+        .await?;
     }
 
-    let final_status: u16 = if failed > 0 { 0xB000 } else { 0x0000 };
+    let accounted = completed.saturating_add(failed).saturating_add(warning);
+    if accounted < total {
+        failed = failed.saturating_add(total - accounted);
+        provider_failed = true;
+        warn!(
+            total,
+            completed, failed, warning, "C-GET provider stream ended early"
+        );
+    }
 
+    let final_status = if provider_failed {
+        STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS
+    } else if failed > 0 || warning > 0 {
+        if completed > 0 || warning > 0 {
+            STATUS_WARNING
+        } else {
+            STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS
+        }
+    } else {
+        STATUS_SUCCESS
+    };
+
+    send_final_response(
+        assoc,
+        ctx_id,
+        &sop_class,
+        msg_id,
+        final_status,
+        SubOperationCounts {
+            remaining: 0,
+            completed,
+            failed,
+            warning,
+        },
+    )
+    .await
+}
+
+async fn send_pending_response(
+    assoc: &mut Association,
+    sop_class: &str,
+    ctx_id: u8,
+    msg_id: u16,
+    counts: SubOperationCounts,
+) -> DcmResult<()> {
+    let mut response = DataSet::new();
+    response.set_uid(tags::AFFECTED_SOP_CLASS_UID, sop_class);
+    response.set_u16(tags::COMMAND_FIELD, 0x8010);
+    response.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
+    response.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101);
+    response.set_u16(tags::STATUS, 0xFF00);
+    response.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, counts.remaining);
+    response.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, counts.completed);
+    response.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, counts.failed);
+    response.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, counts.warning);
+    assoc.send_dimse_command(ctx_id, &response).await
+}
+
+async fn send_final_response(
+    assoc: &mut Association,
+    ctx_id: u8,
+    sop_class: &str,
+    msg_id: u16,
+    status: u16,
+    counts: SubOperationCounts,
+) -> DcmResult<()> {
     let mut final_rsp = DataSet::new();
-    final_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, &sop_class);
+    final_rsp.set_uid(tags::AFFECTED_SOP_CLASS_UID, sop_class);
     final_rsp.set_u16(tags::COMMAND_FIELD, 0x8010); // C-GET-RSP
     final_rsp.set_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO, msg_id);
     final_rsp.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101); // no dataset
-    final_rsp.set_u16(tags::STATUS, final_status);
-    final_rsp.set_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS, 0);
-    final_rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, completed);
-    final_rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, failed);
-    final_rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, 0);
+    final_rsp.set_u16(tags::STATUS, status);
+    final_rsp.set_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS, counts.completed);
+    final_rsp.set_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS, counts.failed);
+    final_rsp.set_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS, counts.warning);
     assoc.send_dimse_command(ctx_id, &final_rsp).await
+}
+
+fn is_warning_status(status: u16) -> bool {
+    status == 0x0001 || status & 0xF000 == 0xB000
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
