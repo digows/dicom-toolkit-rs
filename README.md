@@ -31,7 +31,7 @@ This is an independent project, not affiliated with or endorsed by OFFIS e.V. Se
 |-------|-----------------|-------------|
 | [`dicom-toolkit-core`](crates/dicom-toolkit-core) | `ofstd`, `oficonv`, `oflog` | Error types, UIDs, **full character set support** (ISO 2022 + single-byte + UTF-8), logging |
 | [`dicom-toolkit-dict`](crates/dicom-toolkit-dict) | `dcmdata` (dict) | 90+ tag constants, all 34 VRs, 13 transfer syntaxes, SOP class UID registry |
-| [`dicom-toolkit-data`](crates/dicom-toolkit-data) | `dcmdata` | DICOM data model, Part 10 file reader/writer, DICOM JSON (PS3.18), XML, deflate |
+| [`dicom-toolkit-data`](crates/dicom-toolkit-data) | `dcmdata` | DICOM data model, Part 10 file reader/writer and bounded index inspection, DICOM JSON (PS3.18), XML, deflate |
 | [`dicom-toolkit-net`](crates/dicom-toolkit-net) | `dcmnet`, `dcmtls` | Async DICOM networking: PDU layer, association, C-ECHO/STORE/FIND/GET/MOVE, TLS |
 | [`dicom-toolkit-image`](crates/dicom-toolkit-image) | `dcmimgle`, `dcmimage` | Pixel pipeline, Modality/VOI LUT, window/level, overlays, color models, PNG export |
 | [`dicom-toolkit-codec`](crates/dicom-toolkit-codec) | `dcmjpeg`, `dcmjpls`, `dcmrle`, `dcmjp2k` | JPEG baseline, **pure-Rust JPEG-LS**, **pure-Rust JPEG 2000** (lossless & lossy), RLE PackBits, codec registry |

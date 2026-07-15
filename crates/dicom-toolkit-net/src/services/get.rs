@@ -445,14 +445,11 @@ async fn execute_get_plan(
             store_rq.set_uid(tags::AFFECTED_SOP_INSTANCE_UID, &item.sop_instance_uid);
 
             assoc.send_dimse_command(store_ctx_id, &store_rq).await?;
-            let interrupted = assoc
+            let cancel_observed_while_sending = assoc
                 .send_dimse_data_source_interruptible(store_ctx_id, &item.dataset, msg_id)
                 .await?;
-            if interrupted {
-                failed = failed.saturating_add(1);
-                failed_sop_instance_uids.push(item.sop_instance_uid.clone());
+            if cancel_observed_while_sending {
                 cancelled = true;
-                break;
             }
 
             // Wait for C-STORE-RSP from SCU.
@@ -460,7 +457,7 @@ async fn execute_get_plan(
                 let (_response_context_id, response) = assoc.recv_dimse_command().await?;
                 if is_matching_cancel(&response, msg_id) {
                     cancelled = true;
-                    break None;
+                    continue;
                 }
                 let response_message_id = response
                     .get_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO)
@@ -468,7 +465,7 @@ async fn execute_get_plan(
                 if response.get_u16(tags::COMMAND_FIELD) == Some(0x8001)
                     && response_message_id == sub_msg_id
                 {
-                    break Some(response);
+                    break response;
                 }
                 if response.get_u16(tags::COMMAND_FIELD) == Some(0x0FFF) {
                     continue;
@@ -477,9 +474,6 @@ async fn execute_get_plan(
                     "unexpected command while waiting for C-STORE-RSP: 0x{:04X}",
                     response.get_u16(tags::COMMAND_FIELD).unwrap_or_default()
                 )));
-            };
-            let Some(store_rsp) = store_rsp else {
-                break;
             };
             let store_status = store_rsp.get_u16(tags::STATUS).unwrap_or(0xFFFF);
             let response_message_id = store_rsp
@@ -505,6 +499,10 @@ async fn execute_get_plan(
             failed_sop_instance_uids.push(item.sop_instance_uid.clone());
         }
 
+        if cancelled {
+            break;
+        }
+
         let remaining =
             total.saturating_sub(completed.saturating_add(failed).saturating_add(warning));
         send_pending_response(
@@ -520,10 +518,6 @@ async fn execute_get_plan(
             },
         )
         .await?;
-
-        if cancelled {
-            break;
-        }
     }
 
     let accounted = completed.saturating_add(failed).saturating_add(warning);
@@ -652,7 +646,7 @@ async fn send_final_response_with_failures(
     counts: SubOperationCounts,
     failed_sop_instance_uids: &[String],
 ) -> DcmResult<()> {
-    let response_identifier = if failed_sop_instance_uids.is_empty() && status != STATUS_CANCEL {
+    let response_identifier = if failed_sop_instance_uids.is_empty() {
         None
     } else {
         let mut identifier = DataSet::new();

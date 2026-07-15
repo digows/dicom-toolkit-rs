@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
 
 use dicom_toolkit_core::error::{DcmError, DcmResult};
 use dicom_toolkit_data::DataSet;
@@ -570,7 +571,20 @@ impl Association {
 
     /// Immediately abort the association by sending an A-ABORT PDU.
     pub async fn abort(&mut self) -> DcmResult<()> {
-        let _ = self
+        let _ = self.abort_strict().await;
+        Ok(())
+    }
+
+    /// Immediately abort the association and report an A-ABORT write failure.
+    ///
+    /// This is the strict, additive counterpart to [`Self::abort`], whose
+    /// legacy contract intentionally ignores transport errors.
+    pub async fn abort_strict(&mut self) -> DcmResult<()> {
+        if self.state == AssociationState::Closed {
+            return Ok(());
+        }
+
+        let result = self
             .stream
             .write_all(&pdu::encode_a_abort(&AAbort {
                 source: 0,
@@ -578,7 +592,7 @@ impl Association {
             }))
             .await;
         self.state = AssociationState::Closed;
-        Ok(())
+        result.map_err(Into::into)
     }
 
     // ── Presentation context lookup ───────────────────────────────────────────
@@ -676,10 +690,10 @@ impl Association {
 
     /// Stream a dataset while monitoring the association for a matching C-CANCEL.
     ///
-    /// Cancellation is observed at P-DATA fragment boundaries. If a cancel is
-    /// received after a non-final fragment has started, a minimal final data
-    /// fragment is sent so fragments from a subsequent response are never
-    /// interleaved with the interrupted C-STORE message.
+    /// Cancellation is observed while sending, but the current DIMSE dataset
+    /// is always completed. A C-GET SCP must not set Last Fragment before the
+    /// complete C-STORE-RQ has been sent solely because it received
+    /// C-CANCEL-GET.
     pub(crate) async fn send_dimse_data_source_interruptible(
         &mut self,
         context_id: u8,
@@ -760,16 +774,11 @@ impl Association {
 
         while remaining > 0 {
             cancelled |= self.poll_matching_cancel(retrieve_message_id)?;
-            let requested_limit = if cancelled {
-                2
-            } else {
-                maximum_fragment_length
-            };
-            let requested = usize::try_from(remaining.min(requested_limit as u64))
+            let requested = usize::try_from(remaining.min(maximum_fragment_length as u64))
                 .map_err(|_| DcmError::Other("DIMSE fragment length conversion failed".into()))?;
             reader.read_exact(&mut buffer[..requested]).await?;
             remaining -= requested as u64;
-            let is_last = remaining == 0 || cancelled;
+            let is_last = remaining == 0;
             let encoded = pdu::encode_pdata_fragment(
                 context_id,
                 if is_last { 0x02 } else { 0x00 },
@@ -778,11 +787,119 @@ impl Association {
             cancelled |= self
                 .write_encoded_pdu_monitoring_cancel(&encoded, retrieve_message_id)
                 .await?;
-            if is_last {
-                break;
-            }
         }
         Ok(cancelled)
+    }
+
+    /// Stream a dataset and abort this association after a cancellation is
+    /// observed at a complete P-DATA-TF PDU boundary.
+    ///
+    /// The caller must continue polling this future after cancelling `token`.
+    /// Dropping it during a socket write can still leave a partial PDU on the
+    /// wire. This primitive is used by C-MOVE, where C-CANCEL is received on a
+    /// different association from the active C-STORE sub-operation.
+    pub(crate) async fn send_dimse_data_source_abort_on_cancel(
+        &mut self,
+        context_id: u8,
+        source: &DatasetSource,
+        token: &CancellationToken,
+    ) -> DcmResult<bool> {
+        if token.is_cancelled() {
+            self.abort_strict().await?;
+            return Ok(false);
+        }
+
+        match source {
+            DatasetSource::Bytes(bytes) => {
+                let mut reader = bytes.as_ref();
+                self.send_pdata_reader_abort_on_cancel(
+                    context_id,
+                    &mut reader,
+                    bytes.len() as u64,
+                    token,
+                )
+                .await
+            }
+            DatasetSource::File(file) => {
+                let mut handle = tokio::fs::File::open(file.path()).await?;
+                let file_length = handle.metadata().await?.len();
+                if file.offset() > file_length {
+                    return Err(DcmError::InvalidFile {
+                        reason: format!(
+                            "dataset offset {} exceeds file length {file_length} for {}",
+                            file.offset(),
+                            file.path().display()
+                        ),
+                    });
+                }
+                let available = file_length - file.offset();
+                let length = file.length().unwrap_or(available);
+                if length > available {
+                    return Err(DcmError::InvalidFile {
+                        reason: format!(
+                            "dataset region length {length} exceeds {available} available bytes for {}",
+                            file.path().display()
+                        ),
+                    });
+                }
+                handle.seek(std::io::SeekFrom::Start(file.offset())).await?;
+                self.send_pdata_reader_abort_on_cancel(context_id, &mut handle, length, token)
+                    .await
+            }
+        }
+    }
+
+    async fn send_pdata_reader_abort_on_cancel<R: AsyncRead + Unpin>(
+        &mut self,
+        context_id: u8,
+        reader: &mut R,
+        length: u64,
+        token: &CancellationToken,
+    ) -> DcmResult<bool> {
+        self.ensure_established()?;
+
+        if length % 2 != 0 {
+            return Err(DcmError::Other(
+                "DICOM dataset streams must have an even byte length".into(),
+            ));
+        }
+
+        let maximum_fragment_length =
+            max_pdv_data_length(self.maximum_outgoing_pdu_length, 64 * 1024);
+        let mut buffer = vec![0u8; maximum_fragment_length];
+        let mut remaining = length;
+
+        if remaining == 0 {
+            pdu::write_pdata_fragment(&mut self.stream, context_id, 0x02, &[]).await?;
+            if token.is_cancelled() {
+                self.abort_strict().await?;
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        while remaining > 0 {
+            if token.is_cancelled() {
+                self.abort_strict().await?;
+                return Ok(false);
+            }
+
+            let requested = usize::try_from(remaining.min(maximum_fragment_length as u64))
+                .map_err(|_| DcmError::Other("DIMSE fragment length conversion failed".into()))?;
+            reader.read_exact(&mut buffer[..requested]).await?;
+            remaining -= requested as u64;
+
+            let control = if remaining == 0 { 0x02 } else { 0x00 };
+            pdu::write_pdata_fragment(&mut self.stream, context_id, control, &buffer[..requested])
+                .await?;
+
+            if token.is_cancelled() {
+                self.abort_strict().await?;
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     async fn write_encoded_pdu_monitoring_cancel(
@@ -1949,5 +2066,68 @@ mod tests {
 
         server_task.await.expect("server task");
         assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn cancellable_dataset_stream_aborts_only_after_a_complete_pdu() {
+        use std::io::Write;
+
+        const DATASET_LENGTH: u64 = 32 * 1024 * 1024;
+        let mut source_file = tempfile::NamedTempFile::new().expect("create source file");
+        source_file
+            .as_file_mut()
+            .write_all(&[0_u8; 2])
+            .expect("initialize source file");
+        source_file
+            .as_file()
+            .set_len(DATASET_LENGTH)
+            .expect("create sparse source file");
+        let source = DatasetSource::file_region(source_file.path(), 0, DATASET_LENGTH);
+        let cancellation_token = CancellationToken::new();
+        let server_token = cancellation_token.clone();
+        let (server_stream, mut client_stream) = connect_pair().await;
+
+        let server_task = tokio::spawn(async move {
+            let mut association = Association::accept(server_stream, &AssociationConfig::default())
+                .await
+                .expect("accept association");
+            let completed = association
+                .send_dimse_data_source_abort_on_cancel(1, &source, &server_token)
+                .await
+                .expect("abort cancellable dataset stream");
+            assert!(!completed);
+        });
+
+        client_stream
+            .write_all(&pdu::encode_associate_rq(&associate_rq(16_384)))
+            .await
+            .expect("send associate-rq");
+        assert!(matches!(
+            pdu::read_pdu(&mut client_stream)
+                .await
+                .expect("read associate-ac"),
+            Pdu::AssociateAc(_)
+        ));
+
+        let first_pdu = pdu::read_pdu_with_limit(&mut client_stream, 16_384)
+            .await
+            .expect("read first complete P-DATA-TF PDU");
+        assert!(matches!(first_pdu, Pdu::PDataTf(_)));
+        cancellation_token.cancel();
+
+        let mut data_pdu_count = 1_usize;
+        loop {
+            match pdu::read_pdu_with_limit(&mut client_stream, 16_384)
+                .await
+                .expect("read complete PDU after cancellation")
+            {
+                Pdu::PDataTf(_) => data_pdu_count += 1,
+                Pdu::AAbort(_) => break,
+                other => panic!("expected P-DATA-TF or A-ABORT, got {other:?}"),
+            }
+        }
+
+        assert!(data_pdu_count * 16_384 < DATASET_LENGTH as usize);
+        server_task.await.expect("server task");
     }
 }

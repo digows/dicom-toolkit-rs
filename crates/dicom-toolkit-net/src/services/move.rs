@@ -16,7 +16,8 @@ use crate::services::provider::{
 };
 use crate::services::recv_command_data_bytes;
 use crate::services::store::{
-    c_store, c_store_source, StoreRequest, StoreResponse, StoreSourceRequest,
+    c_store, c_store_source_abort_on_cancel, CancellableStoreOutcome, StoreRequest, StoreResponse,
+    StoreSourceRequest,
 };
 use crate::services::SubOperationCounts;
 
@@ -551,9 +552,20 @@ where
                     failed += 1;
                     failed_sop_instance_uids.push(failed_sop_instance_uid);
                 }
-                MoveStoreOutcome::Cancelled => {
-                    failed += 1;
-                    failed_sop_instance_uids.push(failed_sop_instance_uid);
+                MoveStoreOutcome::Cancelled(response) => {
+                    match response {
+                        Some(Ok(response)) if response.status == STATUS_SUCCESS => completed += 1,
+                        Some(Ok(response)) if is_warning_status(response.status) => warning += 1,
+                        Some(Err(error)) => {
+                            warn!(%error, "cancelled C-MOVE storage sub-operation failed");
+                            failed += 1;
+                            failed_sop_instance_uids.push(failed_sop_instance_uid);
+                        }
+                        Some(Ok(_)) | None => {
+                            failed += 1;
+                            failed_sop_instance_uids.push(failed_sop_instance_uid);
+                        }
+                    }
                     cancelled = true;
                     break;
                 }
@@ -581,7 +593,9 @@ where
     }
 
     if cancelled {
-        drop(sub_assoc);
+        if let Err(error) = sub_assoc.abort_strict().await {
+            warn!(%error, "failed to send A-ABORT on cancelled C-MOVE storage association");
+        }
     } else {
         let _ = sub_assoc.release().await;
     }
@@ -663,7 +677,7 @@ async fn next_move_outcome_or_cancel(
 
 enum MoveStoreOutcome {
     Response(DcmResult<StoreResponse>),
-    Cancelled,
+    Cancelled(Option<DcmResult<StoreResponse>>),
 }
 
 async fn move_store_or_cancel(
@@ -672,16 +686,35 @@ async fn move_store_or_cancel(
     request: StoreSourceRequest,
     retrieve_message_id: u16,
 ) -> DcmResult<MoveStoreOutcome> {
-    let store = c_store_source(sub_association, request);
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let store = c_store_source_abort_on_cancel(sub_association, request, &cancellation_token);
     tokio::pin!(store);
     loop {
         tokio::select! {
-            response = &mut store => return Ok(MoveStoreOutcome::Response(response)),
+            response = &mut store => {
+                return Ok(match response {
+                    Ok(CancellableStoreOutcome::Response(response)) => {
+                        MoveStoreOutcome::Response(Ok(response))
+                    }
+                    Ok(CancellableStoreOutcome::Aborted) => MoveStoreOutcome::Cancelled(None),
+                    Err(error) => MoveStoreOutcome::Response(Err(error)),
+                });
+            }
             readiness = assoc.wait_for_incoming_data() => {
                 readiness?;
                 while let Some((context_id, command)) = assoc.try_recv_dimse_command()? {
                     if is_matching_cancel(&command, retrieve_message_id) {
-                        return Ok(MoveStoreOutcome::Cancelled);
+                        cancellation_token.cancel();
+                        let result = store.await;
+                        return Ok(match result {
+                            Ok(CancellableStoreOutcome::Response(response)) => {
+                                MoveStoreOutcome::Cancelled(Some(Ok(response)))
+                            }
+                            Ok(CancellableStoreOutcome::Aborted) => {
+                                MoveStoreOutcome::Cancelled(None)
+                            }
+                            Err(error) => MoveStoreOutcome::Cancelled(Some(Err(error))),
+                        });
                     }
                     match command.get_u16(tags::COMMAND_FIELD) {
                         Some(0x0FFF) => continue,
@@ -745,11 +778,9 @@ async fn send_final_response_with_failures(
     counts: SubOperationCounts,
     failed_sop_instance_uids: &[String],
 ) -> DcmResult<()> {
-    let needs_identifier = matches!(status, STATUS_CANCEL | STATUS_WARNING)
-        || status == STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS
-        || status == STATUS_UNABLE_TO_PROCESS
-        || status == STATUS_DATASET_MISMATCH;
-    let response_identifier = if needs_identifier {
+    let response_identifier = if failed_sop_instance_uids.is_empty() {
+        None
+    } else {
         let mut identifier = DataSet::new();
         identifier.set_string(
             Tag::new(0x0008, 0x0058),
@@ -763,8 +794,6 @@ async fn send_final_response_with_failures(
         let mut encoded = Vec::new();
         DicomWriter::new(&mut encoded).write_dataset(&identifier, transfer_syntax)?;
         Some(encoded)
-    } else {
-        None
     };
 
     let mut final_rsp = DataSet::new();

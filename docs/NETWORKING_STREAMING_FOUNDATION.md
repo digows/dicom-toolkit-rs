@@ -75,6 +75,16 @@ let source = DatasetSource::file_region(
 The offset must point to the encoded dataset. Sending a Part 10 preamble or
 File Meta Information in a C-STORE dataset is invalid.
 
+`dicom-toolkit-data` provides the additive bounded inspection APIs
+`read_part10_file_layout` and `read_part10_file_index`. The layout reader loads
+only a caller-limited File Meta Information block and returns the exact dataset
+offset and length. The index reader additionally scans a caller-limited,
+decompressed dataset prefix for SOP Class, SOP Instance, Study, and Series
+UIDs. It stops after Series Instance UID, validates the File Meta/Dataset SOP
+identity, and never reads Pixel Data. File Meta bytes, dataset-prefix bytes, UID
+length, and undefined-sequence depth are all caller-configurable through
+`Part10ReadLimits`.
+
 ## Lazy retrieve contracts
 
 `StreamingRetrieveItem` contains the SOP Class UID, SOP Instance UID, actual
@@ -141,18 +151,19 @@ The handler observes cancellation while:
 
 On cancellation it stops requesting provider outcomes, drops the stream,
 starts no new C-STORE sub-operation, and returns final status `0xFE00` with the
-current remaining/completed/failed/warning counters. Final warning, failure,
-and cancel identifiers carry the Failed SOP Instance UID List when known.
+current remaining/completed/failed/warning counters. A response identifier is
+absent when there are no failed SOP Instance UIDs.
 
-DICOM does not allow fragments from different messages to be interleaved. If
-C-GET cancellation is observed after a non-final dataset fragment, the writer
-finishes that interrupted message with a small final data fragment before
-sending the final C-GET response. The resulting C-STORE dataset is incomplete
-and is counted as failed; the association framing remains deterministic.
+For C-GET, an already-started C-STORE-RQ is completed in full and its matching
+C-STORE-RSP is received and accounted before the final C-GET cancel response.
+This avoids marking a truncated dataset as the last fragment solely because
+C-CANCEL-GET was received.
 
-For C-MOVE, the Storage transfer is on a different association. Cancelling an
-in-flight destination C-STORE drops that sub-association before the gateway
-returns the final C-MOVE cancel response on the original association.
+For C-MOVE, the Storage transfer is on a different association. Cancellation
+keeps the active write future alive through the current complete P-DATA-TF PDU
+boundary, sends A-ABORT on the Storage association, and then returns the final
+C-MOVE cancel response on the original association. It never appends A-ABORT
+inside a partially written PDU and never relies on a raw TCP close.
 
 ## Association options and negotiation
 
@@ -208,7 +219,11 @@ The automated suite covers:
 - exact late-bound C-GET context selection with an isolated incompatible item;
 - matching and mismatched C-CANCEL;
 - provider stream drop on C-GET and C-MOVE cancellation;
-- cancellation during a 32 MiB file stream;
+- C-GET cancellation during a 32 MiB file stream, including the complete
+  C-STORE response boundary;
+- C-MOVE Storage cancellation at a complete PDU boundary followed by A-ABORT;
+- bounded Part 10 inspection for explicit, implicit, big-endian, and deflated
+  datasets, including a sparse 900 MiB file;
 - concurrent loopback associations and configurable shutdown deadlines.
 
 The following remain outside the completed claim:
@@ -220,6 +235,5 @@ The following remain outside the completed claim:
 - bounded streaming for incoming C-STORE datasets, which are still fully
   materialized and decoded;
 - transcoding;
-- automatic discovery of the Part 10 dataset offset;
 - application-level download scheduling, cache quotas, retry policy, and
   observability.
