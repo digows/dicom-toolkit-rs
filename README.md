@@ -8,7 +8,7 @@ A pure-Rust port of [DCMTK](https://dicom.offis.de/dcmtk.php.en) 3.7.0 — a com
 
 This is an independent project, not affiliated with or endorsed by OFFIS e.V. See [NOTICE](NOTICE) for attribution details.
 
-[![Tests](https://img.shields.io/badge/tests-595%20passing-brightgreen)](#status)
+[![Tests](https://img.shields.io/badge/tests-602%20passing-brightgreen)](#status)
 
 ---
 
@@ -16,12 +16,12 @@ This is an independent project, not affiliated with or endorsed by OFFIS e.V. Se
 
 | Tier | Scope | Tests |
 |------|-------|-------|
-| 1 — Foundation | `dicom-toolkit-core`, `dicom-toolkit-dict` | 43 + 38 |
-| 2 — Data model & I/O | `dicom-toolkit-data` | 153 |
-| 3 — Networking | `dicom-toolkit-net` | 59 |
-| 4 — Imaging & codecs | `dicom-toolkit-image`, `dicom-toolkit-codec`, `dicom-toolkit-jpeg2000` | 44 + 89 + 46 |
-| Tools | `dicom-toolkit-tools` | 10 integration |
-| **Total** | | **589 unit/integration + 6 doctests = 595 passing, 0 failed** |
+| 1 — Foundation | `dicom-toolkit-core`, `dicom-toolkit-dict` | 44 + 42 |
+| 2 — Data model & I/O | `dicom-toolkit-data` | 182 |
+| 3 — Networking | `dicom-toolkit-net` | 81 |
+| 4 — Imaging & codecs | `dicom-toolkit-image`, `dicom-toolkit-codec`, `dicom-toolkit-jpeg2000` | 55 + 109 + 69 |
+| Tools | `dicom-toolkit-tools` | 14 integration |
+| **Total** | | **596 unit/integration + 6 doctests = 602 passing, 0 failed** |
 
 ---
 

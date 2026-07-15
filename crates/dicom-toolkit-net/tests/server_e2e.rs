@@ -7,7 +7,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_core::uid::sop_class;
 use dicom_toolkit_data::io::{reader::DicomReader, writer::DicomWriter};
 use dicom_toolkit_data::DataSet;
@@ -21,9 +20,8 @@ use dicom_toolkit_net::services::get::GetRequest;
 use dicom_toolkit_net::services::r#move::MoveRequest;
 use dicom_toolkit_net::services::store::StoreRequest;
 use dicom_toolkit_net::{
-    c_echo, c_find, c_get, c_move, c_store, find_responses, Association, FindEvent,
-    FindResponseStream, FindServiceProvider, GetEvent, GetServiceProvider, MoveEvent,
-    MoveServiceProvider, RetrieveItem, RetrievePlan, ScpScuRoleSelection, StaticDestinationLookup,
+    c_echo, c_find, c_get, c_move, c_store, Association, FindEvent, FindServiceProvider, GetEvent,
+    GetServiceProvider, MoveEvent, MoveServiceProvider, RetrieveItem, StaticDestinationLookup,
     StoreEvent, StoreResult, StoreServiceProvider, STATUS_SUCCESS,
 };
 
@@ -143,8 +141,8 @@ struct FixedFindProvider {
 }
 
 impl FindServiceProvider for FixedFindProvider {
-    async fn on_find(&self, _event: FindEvent) -> DcmResult<FindResponseStream> {
-        Ok(find_responses(self.results.clone()))
+    async fn on_find(&self, _event: FindEvent) -> Vec<DataSet> {
+        self.results.clone()
     }
 }
 
@@ -154,8 +152,8 @@ struct FixedGetProvider {
 }
 
 impl GetServiceProvider for FixedGetProvider {
-    async fn on_get(&self, _event: GetEvent) -> DcmResult<RetrievePlan> {
-        RetrievePlan::from_items(self.items.clone())
+    async fn on_get(&self, _event: GetEvent) -> Vec<RetrieveItem> {
+        self.items.clone()
     }
 }
 
@@ -165,8 +163,8 @@ struct FixedMoveProvider {
 }
 
 impl MoveServiceProvider for FixedMoveProvider {
-    async fn on_move(&self, _event: MoveEvent) -> DcmResult<RetrievePlan> {
-        RetrievePlan::from_items(self.items.clone())
+    async fn on_move(&self, _event: MoveEvent) -> Vec<RetrieveItem> {
+        self.items.clone()
     }
 }
 
@@ -243,7 +241,7 @@ async fn test_server_store_loopback() {
             sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
             sop_instance_uid: "1.2.3.server.store.1".to_string(),
             priority: 0,
-            dataset: encode_dataset(&ds).into(),
+            dataset_bytes: encode_dataset(&ds),
             context_id: ctx_id,
         },
     )
@@ -414,8 +412,7 @@ async fn test_server_get_loopback() {
             items: vec![RetrieveItem {
                 sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
                 sop_instance_uid: "1.2.3.1001".to_string(),
-                transfer_syntax_uid: TS_EXPLICIT_LE.to_string(),
-                dataset: inst_bytes.into(),
+                dataset: inst_bytes,
             }],
         })
         .build()
@@ -427,12 +424,7 @@ async fn test_server_get_loopback() {
 
     tokio::spawn(async move { server.run().await });
 
-    let mut cfg = scu_config();
-    cfg.requested_role_selections = vec![ScpScuRoleSelection {
-        sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
-        scu_role: false,
-        scp_role: true,
-    }];
+    let cfg = scu_config();
     let mut assoc = Association::request(
         &addr.to_string(),
         "GETSCP",
@@ -517,8 +509,7 @@ async fn test_server_move_loopback() {
             items: vec![RetrieveItem {
                 sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
                 sop_instance_uid: "1.2.3.1002".to_string(),
-                transfer_syntax_uid: TS_EXPLICIT_LE.to_string(),
-                dataset: inst_bytes.into(),
+                dataset: inst_bytes,
             }],
         })
         .move_destination_lookup(dest_lookup)
@@ -634,7 +625,7 @@ async fn test_server_concurrent_associations() {
                     sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
                     sop_instance_uid: format!("1.2.3.concurrent.{i}"),
                     priority: 0,
-                    dataset: encode_dataset(&ds).into(),
+                    dataset_bytes: encode_dataset(&ds),
                     context_id: ctx_id,
                 },
             )

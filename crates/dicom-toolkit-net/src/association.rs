@@ -12,12 +12,13 @@ use tokio::time::{timeout, Duration};
 use dicom_toolkit_core::error::{DcmError, DcmResult};
 use dicom_toolkit_data::DataSet;
 
-use crate::config::AssociationConfig;
+use crate::config::{AssociationConfig, AssociationOptions};
 use crate::dataset_source::{DatasetSource, FileDataset};
 use crate::dimse;
 use crate::pdu::{
-    self, AAbort, AssociateAc, AssociateRq, AsynchronousOperationsWindow, Pdu, Pdv,
-    PresentationContextAcItem, PresentationContextRqItem, ScpScuRoleSelection,
+    self, AAbort, AssociateAc, AssociateRq, AssociationUserInformation,
+    AsynchronousOperationsWindow, Pdu, Pdv, PresentationContextAcItem, PresentationContextRqItem,
+    ScpScuRoleSelection,
 };
 use crate::presentation::{PcResult, PresentationContextAc, PresentationContextRq};
 
@@ -73,6 +74,14 @@ pub struct Association {
     /// (`PRIVATE_ASSOCIATIONKEY::pdvIndex/pdvCount`). This queue
     /// replicates that behaviour so that no PDVs are silently lost.
     pdv_queue: std::collections::VecDeque<pdu::Pdv>,
+    /// Bytes consumed non-blockingly while monitoring C-CANCEL.
+    incoming_pdu_bytes: Vec<u8>,
+    /// Command fragments retained across non-blocking polls.
+    incoming_command_bytes: Vec<u8>,
+    /// Presentation context of the command currently being assembled.
+    incoming_command_context_id: Option<u8>,
+    /// Complete commands observed while another operation owned the transport.
+    dimse_command_queue: std::collections::VecDeque<(u8, DataSet)>,
 }
 
 impl Association {
@@ -88,8 +97,43 @@ impl Association {
         contexts: &[PresentationContextRq],
         config: &AssociationConfig,
     ) -> DcmResult<Self> {
-        validate_pdu_limits(config)?;
-        validate_requested_role_selections(contexts, &config.requested_role_selections)?;
+        Self::request_internal(
+            addr,
+            called_ae,
+            calling_ae,
+            contexts,
+            config,
+            &legacy_association_options(),
+            false,
+        )
+        .await
+    }
+
+    /// Connect and negotiate an association with bounded-resource and role options.
+    pub async fn request_with_options(
+        addr: &str,
+        called_ae: &str,
+        calling_ae: &str,
+        contexts: &[PresentationContextRq],
+        config: &AssociationConfig,
+        options: &AssociationOptions,
+    ) -> DcmResult<Self> {
+        Self::request_internal(addr, called_ae, calling_ae, contexts, config, options, true).await
+    }
+
+    async fn request_internal(
+        addr: &str,
+        called_ae: &str,
+        calling_ae: &str,
+        contexts: &[PresentationContextRq],
+        config: &AssociationConfig,
+        options: &AssociationOptions,
+        use_extended_negotiation: bool,
+    ) -> DcmResult<Self> {
+        validate_pdu_limits(options)?;
+        if use_extended_negotiation {
+            validate_requested_role_selections(contexts, &options.requested_role_selections)?;
+        }
         let stream = TcpStream::connect(addr).await?;
         let peer_addr = stream.peer_addr()?;
         let mut stream = stream;
@@ -106,34 +150,67 @@ impl Association {
                     transfer_syntaxes: pc.transfer_syntaxes.clone(),
                 })
                 .collect(),
-            max_pdu_length: effective_incoming_pdu_length(config),
+            max_pdu_length: effective_incoming_pdu_length(config, options),
             implementation_class_uid: config.implementation_class_uid.clone(),
             implementation_version_name: config.implementation_version_name.clone(),
-            asynchronous_operations_window: config.requested_asynchronous_operations_window,
-            role_selections: config.requested_role_selections.clone(),
         };
 
-        stream.write_all(&pdu::encode_associate_rq(&rq)).await?;
+        let request_user_information = AssociationUserInformation {
+            asynchronous_operations_window: options.requested_asynchronous_operations_window,
+            role_selections: options.requested_role_selections.clone(),
+        };
 
-        let response = timeout(
-            Duration::from_secs(config.dimse_timeout_secs),
-            pdu::read_pdu_with_limit(&mut stream, config.maximum_incoming_pdu_length),
-        )
-        .await
-        .map_err(|_| DcmError::Timeout {
-            seconds: config.dimse_timeout_secs,
-        })??;
+        let encoded_request = if use_extended_negotiation {
+            pdu::encode_associate_rq_with_user_information(&rq, &request_user_information)
+        } else {
+            pdu::encode_associate_rq(&rq)
+        };
+        stream.write_all(&encoded_request).await?;
+
+        let (response, response_user_information) = if use_extended_negotiation {
+            let decoded_response = timeout(
+                Duration::from_secs(config.dimse_timeout_secs),
+                pdu::read_pdu_with_limit_and_user_information(
+                    &mut stream,
+                    options.maximum_incoming_pdu_length,
+                ),
+            )
+            .await
+            .map_err(|_| DcmError::Timeout {
+                seconds: config.dimse_timeout_secs,
+            })??;
+            (
+                decoded_response.pdu,
+                decoded_response
+                    .association_user_information
+                    .unwrap_or_default(),
+            )
+        } else {
+            let response = timeout(
+                Duration::from_secs(config.dimse_timeout_secs),
+                pdu::read_pdu(&mut stream),
+            )
+            .await
+            .map_err(|_| DcmError::Timeout {
+                seconds: config.dimse_timeout_secs,
+            })??;
+            (response, AssociationUserInformation::default())
+        };
 
         match response {
             Pdu::AssociateAc(ac) => {
-                validate_accepted_role_selections(
-                    &config.requested_role_selections,
-                    &ac.role_selections,
-                )?;
-                let asynchronous_operations_window = requestor_window_from_acceptance(
-                    config.requested_asynchronous_operations_window,
-                    ac.asynchronous_operations_window,
-                )?;
+                let asynchronous_operations_window = if use_extended_negotiation {
+                    validate_accepted_role_selections(
+                        &options.requested_role_selections,
+                        &response_user_information.role_selections,
+                    )?;
+                    requestor_window_from_acceptance(
+                        options.requested_asynchronous_operations_window,
+                        response_user_information.asynchronous_operations_window,
+                    )?
+                } else {
+                    AsynchronousOperationsWindow::default()
+                };
                 // Map raw AC items back to our typed PresentationContextAc,
                 // joining with the original abstract syntaxes from the RQ.
                 let pcs = ac
@@ -163,14 +240,18 @@ impl Association {
                     max_pdu_length: ac.max_pdu_length,
                     maximum_outgoing_pdu_length: effective_outgoing_pdu_length(
                         ac.max_pdu_length,
-                        config,
+                        options,
                     ),
-                    maximum_incoming_pdu_length: effective_incoming_pdu_length(config),
+                    maximum_incoming_pdu_length: options.maximum_incoming_pdu_length,
                     peer_addr,
                     asynchronous_operations_window,
-                    role_selections: ac.role_selections,
+                    role_selections: response_user_information.role_selections,
                     is_requestor: true,
                     pdv_queue: std::collections::VecDeque::new(),
+                    incoming_pdu_bytes: Vec::new(),
+                    incoming_command_bytes: Vec::new(),
+                    incoming_command_context_id: None,
+                    dimse_command_queue: std::collections::VecDeque::new(),
                 })
             }
             Pdu::AssociateRj(rj) => Err(DcmError::AssociationRejected {
@@ -190,18 +271,57 @@ impl Association {
     /// Accept an incoming TCP connection and complete the A-ASSOCIATE-AC
     /// handshake according to `config`.
     pub async fn accept(stream: TcpStream, config: &AssociationConfig) -> DcmResult<Self> {
-        validate_pdu_limits(config)?;
+        Self::accept_internal(stream, config, &legacy_association_options(), false).await
+    }
+
+    /// Accept an association with bounded-resource and role options.
+    pub async fn accept_with_options(
+        stream: TcpStream,
+        config: &AssociationConfig,
+        options: &AssociationOptions,
+    ) -> DcmResult<Self> {
+        Self::accept_internal(stream, config, options, true).await
+    }
+
+    async fn accept_internal(
+        stream: TcpStream,
+        config: &AssociationConfig,
+        options: &AssociationOptions,
+        use_extended_negotiation: bool,
+    ) -> DcmResult<Self> {
+        validate_pdu_limits(options)?;
         let peer_addr = stream.peer_addr()?;
         let mut stream = stream;
 
-        let incoming = timeout(
-            Duration::from_secs(config.dimse_timeout_secs),
-            pdu::read_pdu_with_limit(&mut stream, config.maximum_incoming_pdu_length),
-        )
-        .await
-        .map_err(|_| DcmError::Timeout {
-            seconds: config.dimse_timeout_secs,
-        })??;
+        let (incoming, request_user_information) = if use_extended_negotiation {
+            let decoded_incoming = timeout(
+                Duration::from_secs(config.dimse_timeout_secs),
+                pdu::read_pdu_with_limit_and_user_information(
+                    &mut stream,
+                    options.maximum_incoming_pdu_length,
+                ),
+            )
+            .await
+            .map_err(|_| DcmError::Timeout {
+                seconds: config.dimse_timeout_secs,
+            })??;
+            (
+                decoded_incoming.pdu,
+                decoded_incoming
+                    .association_user_information
+                    .unwrap_or_default(),
+            )
+        } else {
+            let incoming = timeout(
+                Duration::from_secs(config.dimse_timeout_secs),
+                pdu::read_pdu(&mut stream),
+            )
+            .await
+            .map_err(|_| DcmError::Timeout {
+                seconds: config.dimse_timeout_secs,
+            })??;
+            (incoming, AssociationUserInformation::default())
+        };
 
         let rq = match incoming {
             Pdu::AssociateRq(rq) => rq,
@@ -211,7 +331,12 @@ impl Association {
                 ))
             }
         };
-        validate_incoming_role_selections(&rq.presentation_contexts, &rq.role_selections)?;
+        if use_extended_negotiation {
+            validate_incoming_role_selections(
+                &rq.presentation_contexts,
+                &request_user_information.role_selections,
+            )?;
+        }
 
         // Negotiate each proposed presentation context
         let mut accepted_pcs: Vec<PresentationContextAc> = Vec::new();
@@ -240,24 +365,41 @@ impl Association {
             rq.application_context.clone()
         };
 
-        let role_selections = negotiate_role_selections(&rq.role_selections, &accepted_pcs, config);
-        let asynchronous_operations_window = rq
-            .asynchronous_operations_window
-            .map(|requested| negotiate_asynchronous_operations_window(requested, config));
+        let role_selections = if use_extended_negotiation {
+            negotiate_role_selections(
+                &request_user_information.role_selections,
+                &accepted_pcs,
+                options,
+            )
+        } else {
+            Vec::new()
+        };
+        let asynchronous_operations_window = use_extended_negotiation
+            .then_some(request_user_information.asynchronous_operations_window)
+            .flatten()
+            .map(|requested| negotiate_asynchronous_operations_window(requested, options));
 
         let ac = AssociateAc {
             called_ae_title: rq.called_ae_title.clone(),
             calling_ae_title: rq.calling_ae_title.clone(),
             application_context: app_ctx,
             presentation_contexts: ac_items,
-            max_pdu_length: effective_incoming_pdu_length(config),
+            max_pdu_length: effective_incoming_pdu_length(config, options),
             implementation_class_uid: config.implementation_class_uid.clone(),
             implementation_version_name: config.implementation_version_name.clone(),
+        };
+
+        let accept_user_information = AssociationUserInformation {
             asynchronous_operations_window,
             role_selections: role_selections.clone(),
         };
 
-        stream.write_all(&pdu::encode_associate_ac(&ac)).await?;
+        let encoded_accept = if use_extended_negotiation {
+            pdu::encode_associate_ac_with_user_information(&ac, &accept_user_information)
+        } else {
+            pdu::encode_associate_ac(&ac)
+        };
+        stream.write_all(&encoded_accept).await?;
 
         Ok(Association {
             stream,
@@ -266,13 +408,17 @@ impl Association {
             calling_ae: rq.calling_ae_title,
             presentation_contexts: accepted_pcs,
             max_pdu_length: rq.max_pdu_length,
-            maximum_outgoing_pdu_length: effective_outgoing_pdu_length(rq.max_pdu_length, config),
-            maximum_incoming_pdu_length: effective_incoming_pdu_length(config),
+            maximum_outgoing_pdu_length: effective_outgoing_pdu_length(rq.max_pdu_length, options),
+            maximum_incoming_pdu_length: options.maximum_incoming_pdu_length,
             peer_addr,
             asynchronous_operations_window: asynchronous_operations_window.unwrap_or_default(),
             role_selections,
             is_requestor: false,
             pdv_queue: std::collections::VecDeque::new(),
+            incoming_pdu_bytes: Vec::new(),
+            incoming_command_bytes: Vec::new(),
+            incoming_command_context_id: None,
+            dimse_command_queue: std::collections::VecDeque::new(),
         })
     }
 
@@ -290,12 +436,6 @@ impl Association {
         is_last: bool,
     ) -> DcmResult<()> {
         self.ensure_established()?;
-
-        if data.len() % 2 != 0 {
-            return Err(DcmError::Other(
-                "DICOM command and dataset fragment streams must have an even byte length".into(),
-            ));
-        }
 
         let max_data = max_pdv_data_length(self.maximum_outgoing_pdu_length, data.len());
 
@@ -348,11 +488,35 @@ impl Association {
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    /// Gracefully finish the association release handshake.
+    /// Gracefully release the association using the legacy permissive behavior.
     ///
-    /// The association requestor sends A-RELEASE-RQ. The acceptor waits for
-    /// that request and replies with A-RELEASE-RP, as required by DICOM PS3.8.
+    /// This method preserves the pre-streaming contract: it always initiates
+    /// release, accepts any peer PDU as completion, and treats a timeout as a
+    /// successful best-effort release. Use [`release_strict`](Self::release_strict)
+    /// when protocol validation and timeout reporting are required.
     pub async fn release(&mut self) -> DcmResult<()> {
+        if self.state != AssociationState::Established {
+            return Ok(());
+        }
+        self.state = AssociationState::ReleaseRequested;
+        self.stream.write_all(&pdu::encode_release_rq()).await?;
+
+        let result = timeout(Duration::from_secs(30), self.read_next_pdu()).await;
+        self.state = AssociationState::Closed;
+
+        match result {
+            Ok(Ok(Pdu::ReleaseRp)) | Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Gracefully finish the association release handshake with strict
+    /// protocol validation and timeout reporting.
+    ///
+    /// A requestor sends A-RELEASE-RQ and requires A-RELEASE-RP. An acceptor
+    /// waits for A-RELEASE-RQ and replies with A-RELEASE-RP.
+    pub async fn release_strict(&mut self) -> DcmResult<()> {
         if self.state != AssociationState::Established {
             return Ok(());
         }
@@ -362,12 +526,9 @@ impl Association {
         self.state = AssociationState::ReleaseRequested;
         self.stream.write_all(&pdu::encode_release_rq()).await?;
 
-        let incoming = timeout(
-            Duration::from_secs(30),
-            pdu::read_pdu_with_limit(&mut self.stream, self.maximum_incoming_pdu_length),
-        )
-        .await
-        .map_err(|_| DcmError::Timeout { seconds: 30 })??;
+        let incoming = timeout(Duration::from_secs(30), self.read_next_pdu())
+            .await
+            .map_err(|_| DcmError::Timeout { seconds: 30 })??;
 
         self.state = AssociationState::Closed;
 
@@ -384,12 +545,9 @@ impl Association {
     }
 
     async fn wait_for_release_request(&mut self) -> DcmResult<()> {
-        let incoming = timeout(
-            Duration::from_secs(30),
-            pdu::read_pdu_with_limit(&mut self.stream, self.maximum_incoming_pdu_length),
-        )
-        .await
-        .map_err(|_| DcmError::Timeout { seconds: 30 })??;
+        let incoming = timeout(Duration::from_secs(30), self.read_next_pdu())
+            .await
+            .map_err(|_| DcmError::Timeout { seconds: 30 })??;
 
         match incoming {
             Pdu::ReleaseRq => {
@@ -516,6 +674,168 @@ impl Association {
         }
     }
 
+    /// Stream a dataset while monitoring the association for a matching C-CANCEL.
+    ///
+    /// Cancellation is observed at P-DATA fragment boundaries. If a cancel is
+    /// received after a non-final fragment has started, a minimal final data
+    /// fragment is sent so fragments from a subsequent response are never
+    /// interleaved with the interrupted C-STORE message.
+    pub(crate) async fn send_dimse_data_source_interruptible(
+        &mut self,
+        context_id: u8,
+        source: &DatasetSource,
+        retrieve_message_id: u16,
+    ) -> DcmResult<bool> {
+        match source {
+            DatasetSource::Bytes(bytes) => {
+                let mut reader = bytes.as_ref();
+                self.send_pdata_reader_interruptible(
+                    context_id,
+                    &mut reader,
+                    bytes.len() as u64,
+                    retrieve_message_id,
+                )
+                .await
+            }
+            DatasetSource::File(file) => {
+                let mut handle = tokio::fs::File::open(file.path()).await?;
+                let file_length = handle.metadata().await?.len();
+                if file.offset() > file_length {
+                    return Err(DcmError::InvalidFile {
+                        reason: format!(
+                            "dataset offset {} exceeds file length {file_length} for {}",
+                            file.offset(),
+                            file.path().display()
+                        ),
+                    });
+                }
+                let available = file_length - file.offset();
+                let length = file.length().unwrap_or(available);
+                if length > available {
+                    return Err(DcmError::InvalidFile {
+                        reason: format!(
+                            "dataset region length {length} exceeds {available} available bytes for {}",
+                            file.path().display()
+                        ),
+                    });
+                }
+                handle.seek(std::io::SeekFrom::Start(file.offset())).await?;
+                self.send_pdata_reader_interruptible(
+                    context_id,
+                    &mut handle,
+                    length,
+                    retrieve_message_id,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn send_pdata_reader_interruptible<R: AsyncRead + Unpin>(
+        &mut self,
+        context_id: u8,
+        reader: &mut R,
+        length: u64,
+        retrieve_message_id: u16,
+    ) -> DcmResult<bool> {
+        if length % 2 != 0 {
+            return Err(DcmError::Other(
+                "DICOM dataset streams must have an even byte length".into(),
+            ));
+        }
+
+        let maximum_fragment_length =
+            max_pdv_data_length(self.maximum_outgoing_pdu_length, 65_536).max(2);
+        let mut buffer = vec![0u8; maximum_fragment_length];
+        let mut remaining = length;
+        let mut cancelled = self.poll_matching_cancel(retrieve_message_id)?;
+
+        if remaining == 0 {
+            let encoded = pdu::encode_pdata_fragment(context_id, 0x02, &[])?;
+            cancelled |= self
+                .write_encoded_pdu_monitoring_cancel(&encoded, retrieve_message_id)
+                .await?;
+            return Ok(cancelled);
+        }
+
+        while remaining > 0 {
+            cancelled |= self.poll_matching_cancel(retrieve_message_id)?;
+            let requested_limit = if cancelled {
+                2
+            } else {
+                maximum_fragment_length
+            };
+            let requested = usize::try_from(remaining.min(requested_limit as u64))
+                .map_err(|_| DcmError::Other("DIMSE fragment length conversion failed".into()))?;
+            reader.read_exact(&mut buffer[..requested]).await?;
+            remaining -= requested as u64;
+            let is_last = remaining == 0 || cancelled;
+            let encoded = pdu::encode_pdata_fragment(
+                context_id,
+                if is_last { 0x02 } else { 0x00 },
+                &buffer[..requested],
+            )?;
+            cancelled |= self
+                .write_encoded_pdu_monitoring_cancel(&encoded, retrieve_message_id)
+                .await?;
+            if is_last {
+                break;
+            }
+        }
+        Ok(cancelled)
+    }
+
+    async fn write_encoded_pdu_monitoring_cancel(
+        &mut self,
+        encoded: &[u8],
+        retrieve_message_id: u16,
+    ) -> DcmResult<bool> {
+        let mut written = 0usize;
+        let mut cancelled = false;
+        while written < encoded.len() {
+            tokio::select! {
+                readable = self.stream.readable() => {
+                    readable?;
+                    cancelled |= self.poll_matching_cancel(retrieve_message_id)?;
+                }
+                writable = self.stream.writable() => {
+                    writable?;
+                    match self.stream.try_write(&encoded[written..]) {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "failed to write P-DATA-TF PDU",
+                            ).into());
+                        }
+                        Ok(length) => written += length,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+
+    fn poll_matching_cancel(&mut self, retrieve_message_id: u16) -> DcmResult<bool> {
+        let mut cancelled = false;
+        while let Some((context_id, command)) = self.try_recv_dimse_command()? {
+            let command_field = command.get_u16(dicom_toolkit_dict::tags::COMMAND_FIELD);
+            if command_field == Some(0x0FFF) {
+                let target = command
+                    .get_u16(dicom_toolkit_dict::tags::MESSAGE_ID_BEING_RESPONDED_TO)
+                    .unwrap_or_default();
+                if target == retrieve_message_id {
+                    cancelled = true;
+                }
+                continue;
+            }
+            self.dimse_command_queue.push_front((context_id, command));
+            break;
+        }
+        Ok(cancelled)
+    }
+
     async fn send_dimse_file(&mut self, context_id: u8, source: &FileDataset) -> DcmResult<()> {
         let mut file = tokio::fs::File::open(source.path()).await?;
         let file_length = file.metadata().await?.len();
@@ -563,7 +883,7 @@ impl Association {
         }
 
         let maximum_fragment_length =
-            max_pdv_data_length(self.maximum_outgoing_pdu_length, usize::MAX);
+            max_pdv_data_length(self.maximum_outgoing_pdu_length, 64 * 1024);
         let mut buffer = vec![0u8; maximum_fragment_length];
         let mut remaining = length;
 
@@ -593,26 +913,40 @@ impl Association {
     ///
     /// Returns `(context_id, command_dataset)`.
     pub async fn recv_dimse_command(&mut self) -> DcmResult<(u8, DataSet)> {
-        let mut all_data: Vec<u8> = Vec::new();
-        // Initialised to 0; overwritten by the first command PDV received.
-        #[allow(unused_assignments)]
-        let mut ctx_id = 0u8;
-
         loop {
-            let (cid, is_cmd, is_last, data) = self.recv_pdata().await?;
-            if is_cmd {
-                ctx_id = cid;
-                all_data.extend_from_slice(&data);
-                if is_last {
-                    break;
-                }
+            if let Some(command) = self.take_available_dimse_command()? {
+                return Ok(command);
             }
-            // Non-command PDVs are skipped — they should not appear before the
-            // command is complete, but we handle them defensively.
+            self.fill_pdv_queue().await?;
         }
+    }
 
-        let ds = dimse::decode_command_dataset(&all_data)?;
-        Ok((ctx_id, ds))
+    /// Wait until the socket may have inbound bytes without consuming them.
+    ///
+    /// This readiness future is cancellation-safe and is used while waiting
+    /// for a lazy provider item.
+    pub(crate) async fn wait_for_incoming_data(&self) -> DcmResult<()> {
+        self.stream.readable().await?;
+        Ok(())
+    }
+
+    /// Non-blockingly receive one complete DIMSE command if available.
+    pub(crate) fn try_recv_dimse_command(&mut self) -> DcmResult<Option<(u8, DataSet)>> {
+        if let Some(command) = self.take_available_dimse_command()? {
+            return Ok(Some(command));
+        }
+        self.read_available_socket_bytes()?;
+        while let Some(incoming) = self.decode_buffered_pdu()? {
+            self.process_incoming_pdu(incoming)?;
+            if let Some(command) = self.take_available_dimse_command()? {
+                return Ok(Some(command));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn queue_dimse_command(&mut self, context_id: u8, command: DataSet) {
+        self.dimse_command_queue.push_back((context_id, command));
     }
 
     /// Collect data PDVs until the last fragment and return the raw bytes.
@@ -687,32 +1021,123 @@ impl Association {
         }
 
         loop {
-            let pdu = pdu::read_pdu_with_limit(&mut self.stream, self.maximum_incoming_pdu_length)
-                .await?;
-
-            match pdu {
-                Pdu::PDataTf(pd) => {
-                    if pd.pdvs.is_empty() {
-                        continue;
-                    }
-                    self.pdv_queue.extend(pd.pdvs);
-                    return Ok(());
-                }
-                Pdu::AAbort(abort) => {
-                    self.state = AssociationState::Closed;
-                    return Err(DcmError::AssociationAborted {
-                        abort_source: abort.source.to_string(),
-                        reason: abort.reason.to_string(),
-                    });
-                }
-                Pdu::ReleaseRq => {
-                    let _ = self.stream.write_all(&pdu::encode_release_rp()).await;
-                    self.state = AssociationState::Closed;
-                    return Err(DcmError::Other("association released by peer".into()));
-                }
-                _ => {}
+            let incoming = self.read_next_pdu().await?;
+            if matches!(incoming, Pdu::ReleaseRq) {
+                self.stream.write_all(&pdu::encode_release_rp()).await?;
+                self.state = AssociationState::Closed;
+                return Err(DcmError::Other("association released by peer".into()));
+            }
+            self.process_incoming_pdu(incoming)?;
+            if !self.pdv_queue.is_empty() {
+                return Ok(());
             }
         }
+    }
+
+    fn take_available_dimse_command(&mut self) -> DcmResult<Option<(u8, DataSet)>> {
+        if let Some(command) = self.dimse_command_queue.pop_front() {
+            return Ok(Some(command));
+        }
+
+        while let Some(pdv) = self.pdv_queue.pop_front() {
+            if !pdv.is_command() {
+                continue;
+            }
+            match self.incoming_command_context_id {
+                Some(context_id) if context_id != pdv.context_id => {
+                    return Err(DcmError::Other(
+                        "DIMSE command fragments used different presentation contexts".into(),
+                    ));
+                }
+                None => self.incoming_command_context_id = Some(pdv.context_id),
+                _ => {}
+            }
+            self.incoming_command_bytes.extend_from_slice(&pdv.data);
+            if pdv.is_last() {
+                let context_id = self.incoming_command_context_id.take().unwrap_or_default();
+                let encoded = std::mem::take(&mut self.incoming_command_bytes);
+                return Ok(Some((context_id, dimse::decode_command_dataset(&encoded)?)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_available_socket_bytes(&mut self) -> DcmResult<()> {
+        let mut buffer = [0u8; 65_536];
+        loop {
+            match self.stream.try_read(&mut buffer) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "DICOM association closed by peer",
+                    )
+                    .into())
+                }
+                Ok(length) => {
+                    self.incoming_pdu_bytes.extend_from_slice(&buffer[..length]);
+                    if length < buffer.len() {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn decode_buffered_pdu(&mut self) -> DcmResult<Option<Pdu>> {
+        if self.incoming_pdu_bytes.len() < 6 {
+            return Ok(None);
+        }
+        let body_length = u32::from_be_bytes([
+            self.incoming_pdu_bytes[2],
+            self.incoming_pdu_bytes[3],
+            self.incoming_pdu_bytes[4],
+            self.incoming_pdu_bytes[5],
+        ]);
+        if self.maximum_incoming_pdu_length != 0 && body_length > self.maximum_incoming_pdu_length {
+            return Err(DcmError::Other(format!(
+                "PDU length {body_length} exceeds the configured maximum of {} bytes",
+                self.maximum_incoming_pdu_length
+            )));
+        }
+        let total_length = 6usize.saturating_add(body_length as usize);
+        if self.incoming_pdu_bytes.len() < total_length {
+            return Ok(None);
+        }
+        let pdu_type = self.incoming_pdu_bytes[0];
+        let pdu = pdu::decode_pdu_body(pdu_type, &self.incoming_pdu_bytes[6..total_length])?;
+        self.incoming_pdu_bytes.drain(..total_length);
+        Ok(Some(pdu))
+    }
+
+    async fn read_next_pdu(&mut self) -> DcmResult<Pdu> {
+        loop {
+            if let Some(incoming) = self.decode_buffered_pdu()? {
+                return Ok(incoming);
+            }
+            self.stream.readable().await?;
+            self.read_available_socket_bytes()?;
+        }
+    }
+
+    fn process_incoming_pdu(&mut self, incoming: Pdu) -> DcmResult<()> {
+        match incoming {
+            Pdu::PDataTf(data) => self.pdv_queue.extend(data.pdvs),
+            Pdu::AAbort(abort) => {
+                self.state = AssociationState::Closed;
+                return Err(DcmError::AssociationAborted {
+                    abort_source: abort.source.to_string(),
+                    reason: abort.reason.to_string(),
+                });
+            }
+            Pdu::ReleaseRq => {
+                self.state = AssociationState::Closed;
+                return Err(DcmError::Other("association released by peer".into()));
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -793,6 +1218,9 @@ fn choose_preferred_ts_refs(offered: &[&String], preferred: &[String]) -> Option
 
 fn max_pdv_data_length(max_pdu_length: u32, data_len: usize) -> usize {
     const PDV_OVERHEAD: usize = 6;
+    if max_pdu_length == 0 {
+        return data_len.max(1);
+    }
     let available = (max_pdu_length as usize)
         .saturating_sub(PDV_OVERHEAD)
         .max(2);
@@ -800,15 +1228,19 @@ fn max_pdv_data_length(max_pdu_length: u32, data_len: usize) -> usize {
     even_available.min(data_len.max(1))
 }
 
-fn validate_pdu_limits(config: &AssociationConfig) -> DcmResult<()> {
+fn validate_pdu_limits(options: &AssociationOptions) -> DcmResult<()> {
     const MINIMUM_PDU_VARIABLE_FIELD_LENGTH: u32 = 8;
 
-    if config.maximum_incoming_pdu_length < MINIMUM_PDU_VARIABLE_FIELD_LENGTH {
+    if options.maximum_incoming_pdu_length != 0
+        && options.maximum_incoming_pdu_length < MINIMUM_PDU_VARIABLE_FIELD_LENGTH
+    {
         return Err(DcmError::Other(format!(
             "maximum_incoming_pdu_length must be at least {MINIMUM_PDU_VARIABLE_FIELD_LENGTH} bytes"
         )));
     }
-    if config.maximum_outgoing_pdu_length < MINIMUM_PDU_VARIABLE_FIELD_LENGTH {
+    if options.maximum_outgoing_pdu_length != 0
+        && options.maximum_outgoing_pdu_length < MINIMUM_PDU_VARIABLE_FIELD_LENGTH
+    {
         return Err(DcmError::Other(format!(
             "maximum_outgoing_pdu_length must be at least {MINIMUM_PDU_VARIABLE_FIELD_LENGTH} bytes"
         )));
@@ -816,21 +1248,28 @@ fn validate_pdu_limits(config: &AssociationConfig) -> DcmResult<()> {
     Ok(())
 }
 
-fn effective_incoming_pdu_length(config: &AssociationConfig) -> u32 {
-    if config.max_pdu_length == 0 {
-        config.maximum_incoming_pdu_length
-    } else {
-        config
-            .max_pdu_length
-            .min(config.maximum_incoming_pdu_length)
+fn effective_incoming_pdu_length(config: &AssociationConfig, options: &AssociationOptions) -> u32 {
+    match (config.max_pdu_length, options.maximum_incoming_pdu_length) {
+        (0, maximum) | (maximum, 0) => maximum,
+        (configured, maximum) => configured.min(maximum),
     }
 }
 
-fn effective_outgoing_pdu_length(peer_maximum_pdu_length: u32, config: &AssociationConfig) -> u32 {
-    if peer_maximum_pdu_length == 0 {
-        config.maximum_outgoing_pdu_length
-    } else {
-        peer_maximum_pdu_length.min(config.maximum_outgoing_pdu_length)
+fn effective_outgoing_pdu_length(
+    peer_maximum_pdu_length: u32,
+    options: &AssociationOptions,
+) -> u32 {
+    match (peer_maximum_pdu_length, options.maximum_outgoing_pdu_length) {
+        (0, maximum) | (maximum, 0) => maximum,
+        (peer, maximum) => peer.min(maximum),
+    }
+}
+
+fn legacy_association_options() -> AssociationOptions {
+    AssociationOptions {
+        maximum_incoming_pdu_length: 0,
+        maximum_outgoing_pdu_length: 0,
+        ..AssociationOptions::default()
     }
 }
 
@@ -938,7 +1377,7 @@ fn validate_incoming_role_selections(
 fn negotiate_role_selections(
     proposed: &[ScpScuRoleSelection],
     accepted_contexts: &[PresentationContextAc],
-    config: &AssociationConfig,
+    options: &AssociationOptions,
 ) -> Vec<ScpScuRoleSelection> {
     proposed
         .iter()
@@ -949,17 +1388,17 @@ fn negotiate_role_selections(
         })
         .map(|role| ScpScuRoleSelection {
             sop_class_uid: role.sop_class_uid.clone(),
-            scu_role: role.scu_role && config.accept_requestor_scu_role,
-            scp_role: role.scp_role && config.accept_requestor_scp_role,
+            scu_role: role.scu_role && options.accept_requestor_scu_role,
+            scp_role: role.scp_role && options.accept_requestor_scp_role,
         })
         .collect()
 }
 
 fn negotiate_asynchronous_operations_window(
     requestor: AsynchronousOperationsWindow,
-    config: &AssociationConfig,
+    options: &AssociationOptions,
 ) -> AsynchronousOperationsWindow {
-    let acceptor = config.maximum_asynchronous_operations_window;
+    let acceptor = options.maximum_asynchronous_operations_window;
     AsynchronousOperationsWindow {
         invoked: negotiate_window_value(acceptor.invoked, requestor.performed),
         performed: negotiate_window_value(acceptor.performed, requestor.invoked),
@@ -1210,8 +1649,6 @@ mod tests {
             max_pdu_length,
             implementation_class_uid: "1.2.826.0.1.3680043.8.498".into(),
             implementation_version_name: "TEST".into(),
-            asynchronous_operations_window: None,
-            role_selections: Vec::new(),
         }
     }
 

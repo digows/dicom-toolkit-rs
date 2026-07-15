@@ -3,11 +3,10 @@
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, DataSet};
 use dicom_toolkit_dict::tags;
-use tracing::warn;
 
 use crate::association::Association;
 use crate::dataset_source::DatasetSource;
-use crate::services::provider::{StoreEvent, StoreServiceProvider, STATUS_DATASET_MISMATCH};
+use crate::services::provider::{StoreEvent, StoreServiceProvider};
 use crate::services::recv_command_data_bytes;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -15,6 +14,21 @@ use crate::services::recv_command_data_bytes;
 /// Parameters for a C-STORE-RQ.
 #[derive(Debug, Clone)]
 pub struct StoreRequest {
+    /// Affected SOP Class UID.
+    pub sop_class_uid: String,
+    /// Affected SOP Instance UID.
+    pub sop_instance_uid: String,
+    /// Priority: 0=medium, 1=high, 2=low.
+    pub priority: u16,
+    /// Pre-encoded data set bytes (the DICOM object to store).
+    pub dataset_bytes: Vec<u8>,
+    /// Presentation context ID to use.
+    pub context_id: u8,
+}
+
+/// Parameters for a bounded-source C-STORE-RQ.
+#[derive(Debug, Clone)]
+pub struct StoreSourceRequest {
     /// Affected SOP Class UID.
     pub sop_class_uid: String,
     /// Affected SOP Instance UID.
@@ -40,15 +54,41 @@ pub struct StoreResponse {
 
 /// Send a C-STORE-RQ followed by the data set and wait for the C-STORE-RSP.
 pub async fn c_store(assoc: &mut Association, req: StoreRequest) -> DcmResult<StoreResponse> {
-    let context = assoc.context_by_id(req.context_id).ok_or_else(|| {
-        dicom_toolkit_core::error::DcmError::NoPresentationContext {
-            sop_class_uid: req.sop_class_uid.clone(),
+    let source_request = StoreSourceRequest {
+        sop_class_uid: req.sop_class_uid,
+        sop_instance_uid: req.sop_instance_uid,
+        priority: req.priority,
+        dataset: DatasetSource::from(req.dataset_bytes),
+        context_id: req.context_id,
+    };
+    send_store_source(assoc, source_request, false).await
+}
+
+/// Send a C-STORE-RQ from a bounded dataset source.
+pub async fn c_store_source(
+    assoc: &mut Association,
+    req: StoreSourceRequest,
+) -> DcmResult<StoreResponse> {
+    send_store_source(assoc, req, true).await
+}
+
+async fn send_store_source(
+    assoc: &mut Association,
+    req: StoreSourceRequest,
+    validate_context_and_response: bool,
+) -> DcmResult<StoreResponse> {
+    if validate_context_and_response {
+        let context = assoc.context_by_id(req.context_id).ok_or_else(|| {
+            dicom_toolkit_core::error::DcmError::NoPresentationContext {
+                sop_class_uid: req.sop_class_uid.clone(),
+            }
+        })?;
+        if context.abstract_syntax != req.sop_class_uid || !assoc.local_scu_role(&req.sop_class_uid)
+        {
+            return Err(dicom_toolkit_core::error::DcmError::NoPresentationContext {
+                sop_class_uid: req.sop_class_uid.clone(),
+            });
         }
-    })?;
-    if context.abstract_syntax != req.sop_class_uid || !assoc.local_scu_role(&req.sop_class_uid) {
-        return Err(dicom_toolkit_core::error::DcmError::NoPresentationContext {
-            sop_class_uid: req.sop_class_uid.clone(),
-        });
     }
 
     let msg_id = next_message_id();
@@ -69,6 +109,17 @@ pub async fn c_store(assoc: &mut Association, req: StoreRequest) -> DcmResult<St
 
     // Receive C-STORE-RSP
     let (_ctx, rsp) = assoc.recv_dimse_command().await?;
+    if validate_context_and_response {
+        let command_field = rsp.get_u16(tags::COMMAND_FIELD).unwrap_or_default();
+        let response_message_id = rsp
+            .get_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO)
+            .unwrap_or_default();
+        if command_field != 0x8001 || response_message_id != msg_id {
+            return Err(dicom_toolkit_core::error::DcmError::Other(format!(
+                "expected C-STORE-RSP for message {msg_id}, received command 0x{command_field:04X} for message {response_message_id}"
+            )));
+        }
+    }
     let status = rsp.get_u16(tags::STATUS).unwrap_or(0xFFFF);
 
     Ok(StoreResponse {
@@ -122,21 +173,9 @@ where
         .map(|pc| pc.transfer_syntax.trim_end_matches('\0').to_string())
         .unwrap_or_else(|| "1.2.840.10008.1.2.1".to_string());
 
-    let dataset = match DicomReader::new(data.as_slice()).read_dataset(&ts_uid) {
-        Ok(dataset) => dataset,
-        Err(error) => {
-            warn!(%error, "failed to decode C-STORE dataset");
-            return send_store_response(
-                assoc,
-                ctx_id,
-                &sop_class,
-                &sop_instance,
-                msg_id,
-                STATUS_DATASET_MISMATCH,
-            )
-            .await;
-        }
-    };
+    let dataset = DicomReader::new(data.as_slice())
+        .read_dataset(&ts_uid)
+        .unwrap_or_else(|_| DataSet::new());
 
     let event = StoreEvent {
         calling_ae: assoc.calling_ae.clone(),

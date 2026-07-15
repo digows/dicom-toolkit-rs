@@ -1,35 +1,66 @@
-# Networking streaming foundation
+# Additive DIMSE streaming foundation
 
-This document describes the production constraints and public contracts added to
-`dicom-toolkit-net` for large Query/Retrieve workloads. It is intentionally
-explicit about what is implemented and what remains unsafe to claim.
+This document defines the bounded Query/Retrieve path added to
+`dicom-toolkit-net` without replacing the public 0.5 networking API.
 
-## Scope
+The target workload is a DICOM gateway that retrieves encoded instances from
+external storage and serves desktop viewers through C-GET or C-MOVE. Studies
+may contain tens of thousands of instances, and an individual encoded dataset
+may approach one gigabyte. Dataset size must therefore not determine process
+memory usage.
 
-The implemented path targets a DICOM gateway that retrieves encoded instances
-from external storage and serves them to desktop viewers through C-GET or C-MOVE.
-The important invariant is that an encoded instance does not need to be loaded
-into memory before it is sent.
+## Compatibility boundary
 
-The networking crate does not transcode datasets. A provider must declare the
-actual Transfer Syntax UID of every `RetrieveItem`, and the corresponding
-presentation context must be accepted by the peer.
+The original types, public struct literals, provider traits, handlers, builder
+methods, and re-exports remain available. In particular:
 
-## Outgoing dataset sources
+- `AssociationConfig` retains its original fields;
+- `StoreRequest::dataset_bytes` and `RetrieveItem::dataset` remain `Vec<u8>`;
+- `FindServiceProvider`, `GetServiceProvider`, and `MoveServiceProvider` retain
+  their original method signatures;
+- `handle_find_rq`, `handle_get_rq`, `handle_move_rq`, and `handle_store_rq`
+  retain their original signatures;
+- `Association::request`, `Association::accept`, and `Association::release`
+  retain their legacy defaults;
+- a server using only legacy providers retains the legacy association and
+  shutdown defaults.
 
-`DatasetSource` supports two source types:
+New functionality is selected through parallel APIs. The source-compatibility
+fixture in `tests/legacy_api_compat.rs` compiles as an external consumer, and
+`cargo-semver-checks` is used against the upstream baseline.
 
-- `Bytes` for small immutable payloads and tests;
-- `FileDataset` for an exact file region or from an offset through EOF.
+## Public streaming APIs
 
-A file source contains the encoded DIMSE dataset only. A DICOM Part 10 preamble
-and File Meta Information must not be sent by C-STORE, so callers using Part 10
-files must determine the dataset offset and pass that region.
+The additive provider traits are:
 
-The association opens the file lazily, seeks to the declared offset, validates
-the region against the current file length, and reuses one PDU-sized buffer.
-Payload bytes are written directly after the P-DATA/PDV header; there is no
-second payload-sized PDU allocation.
+- `StreamingFindServiceProvider`;
+- `StreamingGetServiceProvider`;
+- `StreamingMoveServiceProvider`.
+
+They are registered with `streaming_find_provider`,
+`streaming_get_provider`, and `streaming_move_provider`. Registering any
+streaming provider enables the bounded `AssociationOptions` defaults. A caller
+can also opt in explicitly with `DicomServerBuilder::association_options`,
+`Association::request_with_options`, or `Association::accept_with_options`.
+
+The original and streaming paths are separate deliberately. Adding fields to
+`AssociationConfig`, `RetrieveItem`, or other types commonly created through
+public struct literals would be source-breaking even if default values existed.
+
+## Dataset sources and memory bounds
+
+`DatasetSource` represents an encoded DIMSE dataset without Part 10 File Meta
+Information:
+
+- `DatasetSource::bytes` stores immutable in-memory bytes;
+- `DatasetSource::file_to_end` streams from an offset through EOF;
+- `DatasetSource::file_region` streams an exact file region.
+
+The association opens a file lazily, validates its current length, seeks to the
+declared offset, and reads it through a reusable buffer. Normal outgoing
+streaming uses at most a 64 KiB dataset buffer per active association, further
+reduced when the effective PDU limit is smaller. The P-DATA writer emits its
+header and payload separately, avoiding a second payload-sized copy.
 
 ```rust
 use dicom_toolkit_net::DatasetSource;
@@ -41,124 +72,154 @@ let source = DatasetSource::file_region(
 );
 ```
 
-## Lazy provider contract
+The offset must point to the encoded dataset. Sending a Part 10 preamble or
+File Meta Information in a C-STORE dataset is invalid.
 
-C-FIND providers return a `FindResponseStream`. C-GET and C-MOVE providers
-return a `RetrievePlan` containing:
+## Lazy retrieve contracts
 
-- the exact number of C-STORE sub-operations, limited by the DIMSE `u16`
-  counters;
-- all required SOP Class/Transfer Syntax presentation-context pairs;
-- a lazy `RetrieveItemStream`.
+`StreamingRetrieveItem` contains the SOP Class UID, SOP Instance UID, actual
+Transfer Syntax UID, and `DatasetSource`. A provider stream yields
+`RetrieveSubOperation` values:
 
-C-MOVE needs the context list before consuming the stream because it must
-negotiate the destination association first. The stream must yield exactly the
-declared number of items. An early end, an extra item, an invalid UID, or a
-stream error becomes a final failure response instead of silently corrupting
-the sub-operation counters.
+- `Ready(item)` for a deliverable instance;
+- `Failed { sop_instance_uid, reason }` for an isolated pre-C-STORE failure.
 
-`DicomServerBuilder::move_destination_config` configures outbound C-MOVE
-associations separately from inbound SCP associations. This separation matters
-because role selections and asynchronous-window proposals are directional. If
-it is omitted, the server copies the inbound limits/timeouts but clears outbound
-role selections.
+An error from the outer stream is reserved for a fatal provider failure that
+prevents further enumeration. This distinction lets independent downloads
+continue after one signed URL, validation, cache, or file failure.
 
-`RetrievePlan::from_items` remains available for small finite lists. Large
-studies should use `RetrievePlan::new` with a genuinely lazy stream.
+The plan declares a `u16` total because DIMSE sub-operation counters are
+16-bit. A stream that ends early, yields too many outcomes, or fails fatally is
+reported deterministically instead of silently corrupting counters.
 
-## API migration
+### C-GET: late-bound exact contexts
 
-This foundation intentionally changes public networking contracts and therefore
-requires a semver-compatible breaking release before publication:
+`GetRetrievePlan` intentionally contains no predeclared storage contexts.
+C-GET uses the association that is already negotiated with the viewer. When an
+item becomes ready, the handler selects an accepted context matching both its
+SOP Class UID and its actual Transfer Syntax UID and verifies the negotiated
+local SCU role.
 
-- `StoreRequest::dataset_bytes: Vec<u8>` is replaced by
-  `StoreRequest::dataset: DatasetSource`;
-- `RetrieveItem::dataset: Vec<u8>` is replaced by `DatasetSource`, and
-  `transfer_syntax_uid` is now mandatory;
-- C-FIND providers return `DcmResult<FindResponseStream>` instead of a
-  `Vec<DataSet>`;
-- C-GET and C-MOVE providers return `DcmResult<RetrievePlan>` instead of a
-  `Vec<RetrieveItem>`;
-- `handle_move_rq` receives a dedicated outbound `AssociationConfig`.
+This supports providers that know the SOP Class from cloud metadata but learn
+the Transfer Syntax only from the downloaded Part 10 File Meta Information. It
+does not add a context after negotiation and does not guess or transcode. A
+missing exact pair fails only that instance, and subsequent independent items
+continue.
 
-`Vec<u8>` and `Bytes` convert directly into `DatasetSource`, while
-`find_responses` and `RetrievePlan::from_items` are migration conveniences for
-small in-memory workloads. These breaking networking contracts are first
-available in the `0.6.0-rc.1` workspace release candidate.
+Registering a streaming C-GET provider lets the association accept a
+requestor-SCP role proposal. The viewer must still propose that role and the
+required Storage presentation contexts.
 
-## Transfer syntax and roles
+### C-MOVE: contexts declared before the destination association
 
-Presentation-context lookup for retrieval matches both SOP Class UID and
-Transfer Syntax UID. C-MOVE creates one destination context per unique pair.
-No implicit fallback to Explicit VR Little Endian occurs.
+`MoveRetrievePlan` requires context candidates because the gateway must open a
+separate Storage association before consuming the item stream. Each candidate
+is an exact SOP-Class/Transfer-Syntax pair.
 
-SCP/SCU Role Selection (`0x54`) is encoded, decoded, validated, and enforced.
-C-GET requestors must propose the SCP role for each Storage SOP Class they want
-to receive. Registering a C-GET provider on `DicomServer` enables acceptance of
-the requestor-SCP role; low-level association users configure this explicitly.
+`build_retrieve_presentation_contexts` validates UIDs, creates the Cartesian
+product of SOP Classes and configured Transfer Syntax candidates, deduplicates
+it, and enforces the DICOM maximum of 128 presentation contexts. The actual
+item still requires an accepted exact pair at delivery time.
 
-The Asynchronous Operations Window (`0x53`) is also encoded, decoded, and
-validated. The ready-made `DicomServer` currently accepts only the synchronous
-window `(1, 1)`. It fails at build time for a larger configured window rather
-than advertising concurrency that its dispatcher does not implement.
+Product-specific candidate policy remains outside the toolkit. The toolkit
+does not silently add transfer syntaxes or transcode an object.
 
-## Resource bounds
+## C-CANCEL behavior
 
-`AssociationConfig` separates three limits:
+Streaming C-GET and C-MOVE handlers demultiplex C-CANCEL while they own the
+association. Cancellation is accepted only when `Message ID Being Responded
+To` matches the active retrieve request. A mismatched cancel is ignored for
+that operation.
 
-- `max_pdu_length`: preferred Maximum Length Received value;
-- `maximum_incoming_pdu_length`: hard pre-allocation ceiling for received PDU
-  variable fields;
-- `maximum_outgoing_pdu_length`: local fragmentation and streaming-buffer
-  ceiling, including when a peer advertises zero (unlimited).
+The handler observes cancellation while:
 
-Incoming PDU lengths are checked before allocating the body. Outgoing DIMSE
-streams use even-sized fragments and reject odd total encoded lengths.
+- waiting for the next lazy provider outcome;
+- between C-STORE sub-operations;
+- waiting for a C-STORE response;
+- writing a large C-GET dataset;
+- awaiting a C-MOVE destination C-STORE operation.
 
-`DicomServer::max_associations` bounds concurrently active associations. Each
-association is handled by one Tokio task, and file I/O uses Tokio's asynchronous
-file API. Memory for a file-backed outgoing instance is therefore bounded by
-the effective PDU size per active association, excluding transport/runtime
-overhead and provider-owned state.
+On cancellation it stops requesting provider outcomes, drops the stream,
+starts no new C-STORE sub-operation, and returns final status `0xFE00` with the
+current remaining/completed/failed/warning counters. Final warning, failure,
+and cancel identifiers carry the Failed SOP Instance UID List when known.
 
-Server shutdown stops accepting new sockets, drains tracked association tasks
-for the builder's configurable `graceful_shutdown_timeout`, and aborts any tasks
-that remain after the deadline. Association tasks are not detached.
+DICOM does not allow fragments from different messages to be interleaved. If
+C-GET cancellation is observed after a non-final dataset fragment, the writer
+finishes that interrupted message with a small final data fragment before
+sending the final C-GET response. The resulting C-STORE dataset is incomplete
+and is counted as failed; the association framing remains deterministic.
 
-## Correct concurrency model for a gateway
+For C-MOVE, the Storage transfer is on a different association. Cancelling an
+in-flight destination C-STORE drops that sub-association before the gateway
+returns the final C-MOVE cancel response on the original association.
 
-DICOM PS3.8 prohibits interleaving fragments from different messages. Hundreds
-of cloud downloads therefore must not be translated into hundreds of
-interleaved DIMSE datasets on one association.
+## Association options and negotiation
 
-The gateway application should use two independently bounded concurrency
-layers:
+`AssociationOptions` holds new resource and negotiation controls separately
+from `AssociationConfig`:
 
-1. a download/cache scheduler that fetches objects concurrently and atomically
-   publishes complete cache files;
-2. the DICOM server association limit, which controls how many viewer
-   connections can stream concurrently.
+- maximum incoming PDU variable-field length;
+- maximum outgoing P-DATA variable-field length;
+- requested and accepted Asynchronous Operations Window;
+- requested and accepted SCP/SCU Role Selection.
 
-A retrieval provider should yield an item only after its cache file is ready.
-Backpressure then propagates naturally from the viewer through the item stream
-without retaining all datasets in memory.
+The legacy PDU decoders retain their permissive treatment of unknown or
+malformed extended user-information items. New
+`*_with_user_information` functions retain and validate the extended items.
 
-## Known gaps before claiming full high-concurrency DIMSE support
+The ready-made server currently accepts only a synchronous asynchronous
+operations window `(1, 1)`. It rejects a larger configured window during build
+instead of advertising concurrency that its dispatcher does not implement.
 
-The following are deliberately not represented as complete:
+## Lifecycle behavior
 
-- C-CANCEL is not yet processed while a provider or a large outgoing dataset is
-  active;
-- the ready-made server does not dispatch multiple outstanding operations on a
-  single association;
-- incoming C-STORE still materializes and decodes the complete dataset before
-  calling `StoreServiceProvider`;
-- interoperability tests currently use Rust loopback peers; validation against
-  DCMTK and the target viewers is still required;
-- a file-backed source requires the caller to provide the Part 10 dataset
-  offset; a bounded metadata-only Part 10 inspector is not yet exposed.
+`Association::release` retains its permissive best-effort behavior.
+`Association::release_strict` is additive and validates the requestor/acceptor
+release handshake and reports timeouts.
 
-The next networking milestone should introduce an association actor with
-independent reader and writer halves, a Message ID keyed operation registry,
-bounded writer queues, and cancellation tokens. Only after that dispatcher is
-tested should `DicomServer` negotiate asynchronous windows larger than one.
+Server shutdown retains detached active associations by default.
+`DicomServerBuilder::graceful_shutdown_timeout` opts into tracked draining and
+aborts remaining connection tasks after the configured deadline.
+
+## Gateway concurrency model
+
+DICOM message fragments cannot be arbitrarily interleaved on one association.
+Cloud download concurrency and DIMSE write concurrency are therefore separate:
+
+1. a bounded download/cache scheduler fetches and validates instances in
+   parallel, then atomically publishes complete cache files;
+2. a lazy retrieve stream yields a file only when it is ready;
+3. each association serializes its DIMSE messages and applies TCP backpressure;
+4. `DicomServer::max_associations` bounds concurrent viewer associations.
+
+This supports hundreds of concurrent cloud transfers without representing
+them as hundreds of interleaved datasets on one DICOM association. Provider
+queues, download permits, cache leases, and disk quotas remain application
+responsibilities.
+
+## Validation and remaining limits
+
+The automated suite covers:
+
+- legacy external-consumer source compatibility;
+- bounded file regions and PDU pre-allocation limits;
+- role and extended-negotiation round trips;
+- exact late-bound C-GET context selection with an isolated incompatible item;
+- matching and mismatched C-CANCEL;
+- provider stream drop on C-GET and C-MOVE cancellation;
+- cancellation during a 32 MiB file stream;
+- concurrent loopback associations and configurable shutdown deadlines.
+
+The following remain outside the completed claim:
+
+- interoperability certification against RadiAnt, Horos, OsiriX, and 3D
+  Slicer;
+- multiple outstanding DIMSE operations on one association;
+- asynchronous-window values larger than `(1, 1)`;
+- bounded streaming for incoming C-STORE datasets, which are still fully
+  materialized and decoded;
+- transcoding;
+- automatic discovery of the Part 10 dataset offset;
+- application-level download scheduling, cache quotas, retry policy, and
+  observability.

@@ -20,9 +20,6 @@ pub const PDU_RELEASE_RQ: u8 = 0x05;
 pub const PDU_RELEASE_RP: u8 = 0x06;
 pub const PDU_A_ABORT: u8 = 0x07;
 
-/// Default safety limit for the variable field of a received PDU.
-pub const DEFAULT_MAXIMUM_INCOMING_PDU_LENGTH: u32 = 16 * 1024 * 1024;
-
 // ── Sub-item type constants ───────────────────────────────────────────────────
 
 const ITEM_APPLICATION_CONTEXT: u8 = 0x10;
@@ -99,10 +96,6 @@ pub struct AssociateRq {
     pub max_pdu_length: u32,
     pub implementation_class_uid: String,
     pub implementation_version_name: String,
-    /// Optional asynchronous operations window proposed by the requestor.
-    pub asynchronous_operations_window: Option<AsynchronousOperationsWindow>,
-    /// Optional SOP Class role selections proposed by the requestor.
-    pub role_selections: Vec<ScpScuRoleSelection>,
 }
 
 /// A-ASSOCIATE-AC PDU body.
@@ -115,10 +108,28 @@ pub struct AssociateAc {
     pub max_pdu_length: u32,
     pub implementation_class_uid: String,
     pub implementation_version_name: String,
-    /// Negotiated asynchronous operations window, if it was proposed.
+}
+
+/// Extended association negotiation carried in User Information sub-items.
+///
+/// This sidecar keeps [`AssociateRq`] and [`AssociateAc`] source-compatible
+/// with earlier releases while exposing asynchronous-operation and role
+/// negotiation to callers that opt in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssociationUserInformation {
+    /// Optional asynchronous operations window.
     pub asynchronous_operations_window: Option<AsynchronousOperationsWindow>,
-    /// Accepted requestor roles for proposed SOP Classes.
+    /// Optional SOP Class role selections expressed as requestor roles.
     pub role_selections: Vec<ScpScuRoleSelection>,
+}
+
+/// A decoded PDU plus extended association User Information when applicable.
+#[derive(Debug, Clone)]
+pub struct DecodedPdu {
+    /// Decoded public PDU value.
+    pub pdu: Pdu,
+    /// Extended User Information for A-ASSOCIATE-RQ/AC PDUs.
+    pub association_user_information: Option<AssociationUserInformation>,
 }
 
 /// A-ASSOCIATE-RJ PDU body.
@@ -331,6 +342,14 @@ fn raw_pdu(pdu_type: u8, body: &[u8]) -> Vec<u8> {
 
 /// Encode an A-ASSOCIATE-RQ PDU into a byte buffer ready to be sent.
 pub fn encode_associate_rq(rq: &AssociateRq) -> Vec<u8> {
+    encode_associate_rq_with_user_information(rq, &AssociationUserInformation::default())
+}
+
+/// Encode an A-ASSOCIATE-RQ with extended User Information.
+pub fn encode_associate_rq_with_user_information(
+    rq: &AssociateRq,
+    user_information: &AssociationUserInformation,
+) -> Vec<u8> {
     let mut body = Vec::new();
     encode_associate_header(
         &mut body,
@@ -345,14 +364,22 @@ pub fn encode_associate_rq(rq: &AssociateRq) -> Vec<u8> {
         rq.max_pdu_length,
         &rq.implementation_class_uid,
         &rq.implementation_version_name,
-        rq.asynchronous_operations_window,
-        &rq.role_selections,
+        user_information.asynchronous_operations_window,
+        &user_information.role_selections,
     ));
     raw_pdu(PDU_ASSOCIATE_RQ, &body)
 }
 
 /// Encode an A-ASSOCIATE-AC PDU.
 pub fn encode_associate_ac(ac: &AssociateAc) -> Vec<u8> {
+    encode_associate_ac_with_user_information(ac, &AssociationUserInformation::default())
+}
+
+/// Encode an A-ASSOCIATE-AC with extended User Information.
+pub fn encode_associate_ac_with_user_information(
+    ac: &AssociateAc,
+    user_information: &AssociationUserInformation,
+) -> Vec<u8> {
     let mut body = Vec::new();
     encode_associate_header(
         &mut body,
@@ -367,8 +394,8 @@ pub fn encode_associate_ac(ac: &AssociateAc) -> Vec<u8> {
         ac.max_pdu_length,
         &ac.implementation_class_uid,
         &ac.implementation_version_name,
-        ac.asynchronous_operations_window,
-        &ac.role_selections,
+        user_information.asynchronous_operations_window,
+        &user_information.role_selections,
     ));
     raw_pdu(PDU_ASSOCIATE_AC, &body)
 }
@@ -493,7 +520,44 @@ impl Default for DecodedUserInformation {
     }
 }
 
-fn decode_user_info(data: &[u8]) -> DcmResult<DecodedUserInformation> {
+fn decode_legacy_user_info(data: &[u8]) -> (u32, String, String) {
+    let mut maximum_pdu_length = 65_536;
+    let mut implementation_class_uid = String::new();
+    let mut implementation_version_name = String::new();
+
+    let mut position = 0;
+    while position + 4 <= data.len() {
+        let item_type = data[position];
+        let item_length = u16::from_be_bytes([data[position + 2], data[position + 3]]) as usize;
+        position += 4;
+        if position + item_length > data.len() {
+            break;
+        }
+        let item_data = &data[position..position + item_length];
+        position += item_length;
+        match item_type {
+            ITEM_MAX_PDU_LENGTH if item_data.len() >= 4 => {
+                maximum_pdu_length =
+                    u32::from_be_bytes([item_data[0], item_data[1], item_data[2], item_data[3]]);
+            }
+            ITEM_IMPLEMENTATION_CLASS_UID => {
+                implementation_class_uid = decode_uid_bytes(item_data);
+            }
+            ITEM_IMPLEMENTATION_VERSION_NAME => {
+                implementation_version_name = String::from_utf8_lossy(item_data).to_string();
+            }
+            _ => {}
+        }
+    }
+
+    (
+        maximum_pdu_length,
+        implementation_class_uid,
+        implementation_version_name,
+    )
+}
+
+fn decode_extended_user_info(data: &[u8]) -> DcmResult<DecodedUserInformation> {
     let mut user_information = DecodedUserInformation::default();
 
     let mut pos = 0;
@@ -572,7 +636,64 @@ fn decode_user_info(data: &[u8]) -> DcmResult<DecodedUserInformation> {
     Ok(user_information)
 }
 
-type SubItemsResult = (
+type LegacySubItemsResult = (
+    Vec<PresentationContextRqItem>,
+    Vec<PresentationContextAcItem>,
+    String,
+    u32,
+    String,
+    String,
+);
+
+fn decode_legacy_sub_items(data: &[u8]) -> DcmResult<LegacySubItemsResult> {
+    let mut request_contexts = Vec::new();
+    let mut accept_contexts = Vec::new();
+    let mut application_context = String::new();
+    let mut maximum_pdu_length = 65_536;
+    let mut implementation_class_uid = String::new();
+    let mut implementation_version_name = String::new();
+
+    let mut position = 0;
+    while position + 4 <= data.len() {
+        let item_type = data[position];
+        let item_length = u16::from_be_bytes([data[position + 2], data[position + 3]]) as usize;
+        position += 4;
+        if position + item_length > data.len() {
+            return Err(DcmError::Other(format!(
+                "sub-item 0x{:02X} truncated (need {}, have {})",
+                item_type,
+                item_length,
+                data.len() - position + item_length,
+            )));
+        }
+        let item_data = &data[position..position + item_length];
+        position += item_length;
+
+        match item_type {
+            ITEM_APPLICATION_CONTEXT => application_context = decode_uid_bytes(item_data),
+            ITEM_PRESENTATION_CONTEXT_RQ => request_contexts.push(decode_pc_rq(item_data)?),
+            ITEM_PRESENTATION_CONTEXT_AC => accept_contexts.push(decode_pc_ac(item_data)?),
+            ITEM_USER_INFORMATION => {
+                let decoded = decode_legacy_user_info(item_data);
+                maximum_pdu_length = decoded.0;
+                implementation_class_uid = decoded.1;
+                implementation_version_name = decoded.2;
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        request_contexts,
+        accept_contexts,
+        application_context,
+        maximum_pdu_length,
+        implementation_class_uid,
+        implementation_version_name,
+    ))
+}
+
+type ExtendedSubItemsResult = (
     Vec<PresentationContextRqItem>,
     Vec<PresentationContextAcItem>,
     String,
@@ -582,7 +703,7 @@ type SubItemsResult = (
 /// Decode the sub-items block common to both RQ and AC associate PDUs.
 ///
 /// Returns request contexts, accept contexts, application context, and user information.
-fn decode_sub_items(data: &[u8]) -> DcmResult<SubItemsResult> {
+fn decode_extended_sub_items(data: &[u8]) -> DcmResult<ExtendedSubItemsResult> {
     let mut rq_pcs = Vec::new();
     let mut ac_pcs = Vec::new();
     let mut app_context = String::new();
@@ -615,7 +736,7 @@ fn decode_sub_items(data: &[u8]) -> DcmResult<SubItemsResult> {
                 ac_pcs.push(decode_pc_ac(item_data)?);
             }
             ITEM_USER_INFORMATION => {
-                user_information = decode_user_info(item_data)?;
+                user_information = decode_extended_user_info(item_data)?;
             }
             _ => {} // unknown sub-items are silently ignored per DICOM
         }
@@ -627,6 +748,37 @@ fn decode_sub_items(data: &[u8]) -> DcmResult<SubItemsResult> {
 
 /// Decode an A-ASSOCIATE-RQ body (everything after the 6-byte PDU header).
 pub fn decode_associate_rq(body: &[u8]) -> DcmResult<AssociateRq> {
+    if body.len() < 68 {
+        return Err(DcmError::Other(format!(
+            "A-ASSOCIATE-RQ body too short: {} bytes",
+            body.len()
+        )));
+    }
+    let called_ae_title = read_ae_title(&body[4..20]);
+    let calling_ae_title = read_ae_title(&body[20..36]);
+    let (
+        presentation_contexts,
+        _,
+        application_context,
+        max_pdu_length,
+        implementation_class_uid,
+        implementation_version_name,
+    ) = decode_legacy_sub_items(&body[68..])?;
+    Ok(AssociateRq {
+        called_ae_title,
+        calling_ae_title,
+        application_context,
+        presentation_contexts,
+        max_pdu_length,
+        implementation_class_uid,
+        implementation_version_name,
+    })
+}
+
+/// Decode an A-ASSOCIATE-RQ and its extended User Information.
+pub fn decode_associate_rq_with_user_information(
+    body: &[u8],
+) -> DcmResult<(AssociateRq, AssociationUserInformation)> {
     // Fixed header: 2B ver + 2B reserved + 16B called + 16B calling + 32B reserved = 68 B
     if body.len() < 68 {
         return Err(DcmError::Other(format!(
@@ -636,8 +788,8 @@ pub fn decode_associate_rq(body: &[u8]) -> DcmResult<AssociateRq> {
     }
     let called = read_ae_title(&body[4..20]);
     let calling = read_ae_title(&body[20..36]);
-    let (rq_pcs, _, app_ctx, user_information) = decode_sub_items(&body[68..])?;
-    Ok(AssociateRq {
+    let (rq_pcs, _, app_ctx, user_information) = decode_extended_sub_items(&body[68..])?;
+    let request = AssociateRq {
         called_ae_title: called,
         calling_ae_title: calling,
         application_context: app_ctx,
@@ -645,9 +797,12 @@ pub fn decode_associate_rq(body: &[u8]) -> DcmResult<AssociateRq> {
         max_pdu_length: user_information.max_pdu_length,
         implementation_class_uid: user_information.implementation_class_uid,
         implementation_version_name: user_information.implementation_version_name,
+    };
+    let extended = AssociationUserInformation {
         asynchronous_operations_window: user_information.asynchronous_operations_window,
         role_selections: user_information.role_selections,
-    })
+    };
+    Ok((request, extended))
 }
 
 /// Decode an A-ASSOCIATE-AC body.
@@ -658,10 +813,41 @@ pub fn decode_associate_ac(body: &[u8]) -> DcmResult<AssociateAc> {
             body.len()
         )));
     }
+    let called_ae_title = read_ae_title(&body[4..20]);
+    let calling_ae_title = read_ae_title(&body[20..36]);
+    let (
+        _,
+        presentation_contexts,
+        application_context,
+        max_pdu_length,
+        implementation_class_uid,
+        implementation_version_name,
+    ) = decode_legacy_sub_items(&body[68..])?;
+    Ok(AssociateAc {
+        called_ae_title,
+        calling_ae_title,
+        application_context,
+        presentation_contexts,
+        max_pdu_length,
+        implementation_class_uid,
+        implementation_version_name,
+    })
+}
+
+/// Decode an A-ASSOCIATE-AC and its extended User Information.
+pub fn decode_associate_ac_with_user_information(
+    body: &[u8],
+) -> DcmResult<(AssociateAc, AssociationUserInformation)> {
+    if body.len() < 68 {
+        return Err(DcmError::Other(format!(
+            "A-ASSOCIATE-AC body too short: {} bytes",
+            body.len()
+        )));
+    }
     let called = read_ae_title(&body[4..20]);
     let calling = read_ae_title(&body[20..36]);
-    let (_, ac_pcs, app_ctx, user_information) = decode_sub_items(&body[68..])?;
-    Ok(AssociateAc {
+    let (_, ac_pcs, app_ctx, user_information) = decode_extended_sub_items(&body[68..])?;
+    let accept = AssociateAc {
         called_ae_title: called,
         calling_ae_title: calling,
         application_context: app_ctx,
@@ -669,9 +855,12 @@ pub fn decode_associate_ac(body: &[u8]) -> DcmResult<AssociateAc> {
         max_pdu_length: user_information.max_pdu_length,
         implementation_class_uid: user_information.implementation_class_uid,
         implementation_version_name: user_information.implementation_version_name,
+    };
+    let extended = AssociationUserInformation {
         asynchronous_operations_window: user_information.asynchronous_operations_window,
         role_selections: user_information.role_selections,
-    })
+    };
+    Ok((accept, extended))
 }
 
 /// Decode an A-ASSOCIATE-RJ body.
@@ -729,7 +918,8 @@ pub fn decode_a_abort(body: &[u8]) -> AAbort {
 ///
 /// Reads the 6-byte header first, then the body.
 pub async fn read_pdu<R: AsyncRead + Unpin>(reader: &mut R) -> DcmResult<Pdu> {
-    read_pdu_with_limit(reader, DEFAULT_MAXIMUM_INCOMING_PDU_LENGTH).await
+    let (pdu_type, body) = read_pdu_bytes(reader, None).await?;
+    decode_pdu_body(pdu_type, &body)
 }
 
 /// Read and decode a complete PDU while enforcing a variable-field limit.
@@ -740,33 +930,79 @@ pub async fn read_pdu_with_limit<R: AsyncRead + Unpin>(
     reader: &mut R,
     maximum_pdu_length: u32,
 ) -> DcmResult<Pdu> {
+    let maximum = (maximum_pdu_length != 0).then_some(maximum_pdu_length);
+    let (pdu_type, body) = read_pdu_bytes(reader, maximum).await?;
+    decode_pdu_body(pdu_type, &body)
+}
+
+/// Read a bounded PDU and retain extended association User Information.
+pub async fn read_pdu_with_limit_and_user_information<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    maximum_pdu_length: u32,
+) -> DcmResult<DecodedPdu> {
+    let maximum = (maximum_pdu_length != 0).then_some(maximum_pdu_length);
+    let (pdu_type, body) = read_pdu_bytes(reader, maximum).await?;
+    decode_pdu_body_with_user_information(pdu_type, &body)
+}
+
+async fn read_pdu_bytes<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    maximum_pdu_length: Option<u32>,
+) -> DcmResult<(u8, Vec<u8>)> {
     let mut header = [0u8; 6];
     reader.read_exact(&mut header).await?;
     let pdu_type = header[0];
     let body_length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
-    if body_length > maximum_pdu_length {
-        return Err(DcmError::PduLengthExceeded {
-            length: body_length,
-            maximum: maximum_pdu_length,
-        });
+    if maximum_pdu_length.is_some_and(|maximum| body_length > maximum) {
+        return Err(DcmError::Other(format!(
+            "PDU length {body_length} exceeds the configured maximum of {} bytes",
+            maximum_pdu_length.unwrap_or_default()
+        )));
     }
     let body_len = body_length as usize;
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).await?;
 
+    Ok((pdu_type, body))
+}
+
+pub(crate) fn decode_pdu_body(pdu_type: u8, body: &[u8]) -> DcmResult<Pdu> {
     match pdu_type {
-        PDU_ASSOCIATE_RQ => Ok(Pdu::AssociateRq(decode_associate_rq(&body)?)),
-        PDU_ASSOCIATE_AC => Ok(Pdu::AssociateAc(decode_associate_ac(&body)?)),
-        PDU_ASSOCIATE_RJ => Ok(Pdu::AssociateRj(decode_associate_rj(&body)?)),
-        PDU_P_DATA_TF => Ok(Pdu::PDataTf(decode_p_data_tf(&body)?)),
+        PDU_ASSOCIATE_RQ => Ok(Pdu::AssociateRq(decode_associate_rq(body)?)),
+        PDU_ASSOCIATE_AC => Ok(Pdu::AssociateAc(decode_associate_ac(body)?)),
+        PDU_ASSOCIATE_RJ => Ok(Pdu::AssociateRj(decode_associate_rj(body)?)),
+        PDU_P_DATA_TF => Ok(Pdu::PDataTf(decode_p_data_tf(body)?)),
         PDU_RELEASE_RQ => Ok(Pdu::ReleaseRq),
         PDU_RELEASE_RP => Ok(Pdu::ReleaseRp),
-        PDU_A_ABORT => Ok(Pdu::AAbort(decode_a_abort(&body))),
+        PDU_A_ABORT => Ok(Pdu::AAbort(decode_a_abort(body))),
+        other => Err(DcmError::Other(format!("unknown PDU type: 0x{other:02X}"))),
+    }
+}
+
+fn decode_pdu_body_with_user_information(pdu_type: u8, body: &[u8]) -> DcmResult<DecodedPdu> {
+    let (pdu, association_user_information) = match pdu_type {
+        PDU_ASSOCIATE_RQ => {
+            let (request, user_information) = decode_associate_rq_with_user_information(body)?;
+            (Pdu::AssociateRq(request), Some(user_information))
+        }
+        PDU_ASSOCIATE_AC => {
+            let (accept, user_information) = decode_associate_ac_with_user_information(body)?;
+            (Pdu::AssociateAc(accept), Some(user_information))
+        }
+        PDU_ASSOCIATE_RJ => (Pdu::AssociateRj(decode_associate_rj(body)?), None),
+        PDU_P_DATA_TF => (Pdu::PDataTf(decode_p_data_tf(body)?), None),
+        PDU_RELEASE_RQ => (Pdu::ReleaseRq, None),
+        PDU_RELEASE_RP => (Pdu::ReleaseRp, None),
+        PDU_A_ABORT => (Pdu::AAbort(decode_a_abort(body)), None),
         other => Err(DcmError::Other(format!(
             "unknown PDU type: 0x{:02X}",
             other
-        ))),
-    }
+        )))?,
+    };
+    Ok(DecodedPdu {
+        pdu,
+        association_user_information,
+    })
 }
 
 /// Write pre-encoded PDU bytes to an async writer.
@@ -784,7 +1020,31 @@ pub async fn write_pdata_fragment<W: AsyncWrite + Unpin>(
     message_control: u8,
     data: &[u8],
 ) -> DcmResult<()> {
-    let item_length = u32::try_from(data.len().saturating_add(2))
+    let header = pdata_fragment_header(context_id, message_control, data.len())?;
+    writer.write_all(&header).await?;
+    writer.write_all(data).await?;
+    Ok(())
+}
+
+/// Encode one P-DATA-TF PDU containing a single PDV.
+pub fn encode_pdata_fragment(
+    context_id: u8,
+    message_control: u8,
+    data: &[u8],
+) -> DcmResult<Vec<u8>> {
+    let header = pdata_fragment_header(context_id, message_control, data.len())?;
+    let mut encoded = Vec::with_capacity(header.len() + data.len());
+    encoded.extend_from_slice(&header);
+    encoded.extend_from_slice(data);
+    Ok(encoded)
+}
+
+fn pdata_fragment_header(
+    context_id: u8,
+    message_control: u8,
+    data_length: usize,
+) -> DcmResult<[u8; 12]> {
+    let item_length = u32::try_from(data_length.saturating_add(2))
         .map_err(|_| DcmError::Other("PDV payload exceeds the DICOM u32 length field".into()))?;
     let body_length = item_length
         .checked_add(4)
@@ -797,9 +1057,7 @@ pub async fn write_pdata_fragment<W: AsyncWrite + Unpin>(
     header[10] = context_id;
     header[11] = message_control;
 
-    writer.write_all(&header).await?;
-    writer.write_all(data).await?;
-    Ok(())
+    Ok(header)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -824,6 +1082,11 @@ mod tests {
             max_pdu_length: 65_536,
             implementation_class_uid: "1.3.6.1.4.1.30071.8.1".to_string(),
             implementation_version_name: "TEST_IMPL".to_string(),
+        }
+    }
+
+    fn sample_user_information() -> AssociationUserInformation {
+        AssociationUserInformation {
             asynchronous_operations_window: Some(AsynchronousOperationsWindow {
                 invoked: 4,
                 performed: 3,
@@ -839,7 +1102,8 @@ mod tests {
     #[test]
     fn associate_rq_roundtrip() {
         let rq = sample_rq();
-        let encoded = encode_associate_rq(&rq);
+        let user_information = sample_user_information();
+        let encoded = encode_associate_rq_with_user_information(&rq, &user_information);
 
         // PDU type byte
         assert_eq!(encoded[0], PDU_ASSOCIATE_RQ);
@@ -849,7 +1113,8 @@ mod tests {
             u32::from_be_bytes([encoded[2], encoded[3], encoded[4], encoded[5]]) as usize;
         assert_eq!(body_len, encoded.len() - 6);
 
-        let decoded = decode_associate_rq(&encoded[6..]).unwrap();
+        let (decoded, decoded_user_information) =
+            decode_associate_rq_with_user_information(&encoded[6..]).unwrap();
         assert_eq!(decoded.called_ae_title, "SCP");
         assert_eq!(decoded.calling_ae_title, "SCU");
         assert_eq!(decoded.application_context, "1.2.840.10008.3.1.1.1");
@@ -864,13 +1129,24 @@ mod tests {
         assert_eq!(decoded.implementation_class_uid, "1.3.6.1.4.1.30071.8.1");
         assert_eq!(decoded.implementation_version_name, "TEST_IMPL");
         assert_eq!(
-            decoded.asynchronous_operations_window,
+            decoded_user_information.asynchronous_operations_window,
             Some(AsynchronousOperationsWindow {
                 invoked: 4,
                 performed: 3,
             })
         );
-        assert_eq!(decoded.role_selections, rq.role_selections);
+        assert_eq!(decoded_user_information, user_information);
+    }
+
+    #[test]
+    fn legacy_user_information_decoder_ignores_malformed_extended_items() {
+        let malformed_role_selection = [ITEM_SCP_SCU_ROLE_SELECTION, 0, 0, 3, 0, 1, b'1'];
+
+        let legacy = decode_legacy_user_info(&malformed_role_selection);
+        assert_eq!(legacy.0, 65_536);
+        assert!(legacy.1.is_empty());
+        assert!(legacy.2.is_empty());
+        assert!(decode_extended_user_info(&malformed_role_selection).is_err());
     }
 
     #[test]
@@ -887,6 +1163,8 @@ mod tests {
             max_pdu_length: 32_768,
             implementation_class_uid: "1.3.6.1.4.1.30071.8.1".to_string(),
             implementation_version_name: "SCP_IMPL".to_string(),
+        };
+        let user_information = AssociationUserInformation {
             asynchronous_operations_window: Some(AsynchronousOperationsWindow {
                 invoked: 2,
                 performed: 1,
@@ -898,10 +1176,11 @@ mod tests {
             }],
         };
 
-        let encoded = encode_associate_ac(&ac);
+        let encoded = encode_associate_ac_with_user_information(&ac, &user_information);
         assert_eq!(encoded[0], PDU_ASSOCIATE_AC);
 
-        let decoded = decode_associate_ac(&encoded[6..]).unwrap();
+        let (decoded, decoded_user_information) =
+            decode_associate_ac_with_user_information(&encoded[6..]).unwrap();
         assert_eq!(decoded.called_ae_title, "SCP");
         assert_eq!(decoded.presentation_contexts.len(), 1);
         assert_eq!(decoded.presentation_contexts[0].result, 0);
@@ -911,10 +1190,10 @@ mod tests {
         );
         assert_eq!(decoded.max_pdu_length, 32_768);
         assert_eq!(
-            decoded.asynchronous_operations_window,
-            ac.asynchronous_operations_window
+            decoded_user_information.asynchronous_operations_window,
+            user_information.asynchronous_operations_window
         );
-        assert_eq!(decoded.role_selections, ac.role_selections);
+        assert_eq!(decoded_user_information, user_information);
     }
 
     #[test]
@@ -1002,8 +1281,6 @@ mod tests {
             max_pdu_length: 65_536,
             implementation_class_uid: "1.2.3".to_string(),
             implementation_version_name: String::new(),
-            asynchronous_operations_window: None,
-            role_selections: Vec::new(),
         };
         let encoded = encode_associate_rq(&rq);
         let decoded = decode_associate_rq(&encoded[6..]).unwrap();
@@ -1056,12 +1333,8 @@ mod tests {
 
         let result = read_pdu_with_limit(&mut cursor, 1_024).await;
 
-        assert!(matches!(
-            result,
-            Err(DcmError::PduLengthExceeded {
-                length: 4_096,
-                maximum: 1_024,
-            })
-        ));
+        assert!(
+            matches!(result, Err(DcmError::Other(message)) if message.contains("4096") && message.contains("1024"))
+        );
     }
 }

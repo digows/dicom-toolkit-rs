@@ -191,7 +191,7 @@ async fn test_store_loopback() {
         sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
         sop_instance_uid: "1.2.3.4.5.6".to_string(),
         priority: 0,
-        dataset: dataset_bytes.into(),
+        dataset_bytes,
         context_id: ctx_id,
     };
     let rsp = c_store(&mut assoc, req).await.unwrap();
@@ -338,9 +338,14 @@ async fn test_get_loopback() {
     tokio::spawn(async move {
         ready_clone.notify_one();
         let (stream, _) = listener.accept().await.unwrap();
-        let mut scp_config = open_scp_config("GETSCP");
-        scp_config.accept_requestor_scp_role = true;
-        let mut assoc = Association::accept(stream, &scp_config).await.unwrap();
+        let scp_config = open_scp_config("GETSCP");
+        let scp_options = dicom_toolkit_net::AssociationOptions {
+            accept_requestor_scp_role: true,
+            ..Default::default()
+        };
+        let mut assoc = Association::accept_with_options(stream, &scp_config, &scp_options)
+            .await
+            .unwrap();
 
         let (ctx_id, cmd) = assoc.recv_dimse_command().await.unwrap();
         assert_eq!(cmd.get_u16(tags::COMMAND_FIELD), Some(0x0010)); // C-GET-RQ
@@ -418,7 +423,8 @@ async fn test_get_loopback() {
 
     // ── SCU ───────────────────────────────────────────────────────────────────
     ready.notified().await;
-    let scu_cfg = AssociationConfig {
+    let scu_cfg = AssociationConfig::default();
+    let scu_options = dicom_toolkit_net::AssociationOptions {
         requested_role_selections: vec![ScpScuRoleSelection {
             sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
             scu_role: false,
@@ -426,12 +432,13 @@ async fn test_get_loopback() {
         }],
         ..Default::default()
     };
-    let mut assoc = Association::request(
+    let mut assoc = Association::request_with_options(
         &format!("127.0.0.1:{port}"),
         "GETSCP",
         "GETSCU",
         &[qr_get_context(1), ct_store_context(3)],
         &scu_cfg,
+        &scu_options,
     )
     .await
     .unwrap();
@@ -604,7 +611,7 @@ async fn test_move_loopback() {
                 sop_class_uid: sc.to_string(),
                 sop_instance_uid: si.to_string(),
                 priority: 0,
-                dataset: data.to_vec().into(),
+                dataset_bytes: data.to_vec(),
                 context_id: store_ctx,
             };
             let store_rsp = c_store(&mut sub, req).await.unwrap();
