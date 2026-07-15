@@ -3,6 +3,7 @@
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, DataSet};
 use dicom_toolkit_dict::tags;
+use tokio_util::sync::CancellationToken;
 
 use crate::association::Association;
 use crate::dataset_source::DatasetSource;
@@ -70,6 +71,67 @@ pub async fn c_store_source(
     req: StoreSourceRequest,
 ) -> DcmResult<StoreResponse> {
     send_store_source(assoc, req, true).await
+}
+
+pub(crate) enum CancellableStoreOutcome {
+    Response(StoreResponse),
+    Aborted,
+}
+
+pub(crate) async fn c_store_source_abort_on_cancel(
+    assoc: &mut Association,
+    req: StoreSourceRequest,
+    cancellation_token: &CancellationToken,
+) -> DcmResult<CancellableStoreOutcome> {
+    let context = assoc.context_by_id(req.context_id).ok_or_else(|| {
+        dicom_toolkit_core::error::DcmError::NoPresentationContext {
+            sop_class_uid: req.sop_class_uid.clone(),
+        }
+    })?;
+    if context.abstract_syntax != req.sop_class_uid || !assoc.local_scu_role(&req.sop_class_uid) {
+        return Err(dicom_toolkit_core::error::DcmError::NoPresentationContext {
+            sop_class_uid: req.sop_class_uid.clone(),
+        });
+    }
+
+    let message_id = next_message_id();
+    let mut command = DataSet::new();
+    command.set_uid(tags::AFFECTED_SOP_CLASS_UID, &req.sop_class_uid);
+    command.set_u16(tags::COMMAND_FIELD, 0x0001);
+    command.set_u16(tags::MESSAGE_ID, message_id);
+    command.set_u16(tags::PRIORITY, req.priority);
+    command.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0000);
+    command.set_uid(tags::AFFECTED_SOP_INSTANCE_UID, &req.sop_instance_uid);
+
+    assoc.send_dimse_command(req.context_id, &command).await?;
+    let dataset_completed = assoc
+        .send_dimse_data_source_abort_on_cancel(req.context_id, &req.dataset, cancellation_token)
+        .await?;
+    if !dataset_completed {
+        return Ok(CancellableStoreOutcome::Aborted);
+    }
+
+    let (_response_context_id, response) = tokio::select! {
+        response = assoc.recv_dimse_command() => response?,
+        () = cancellation_token.cancelled() => {
+            assoc.abort_strict().await?;
+            return Ok(CancellableStoreOutcome::Aborted);
+        }
+    };
+    let command_field = response.get_u16(tags::COMMAND_FIELD).unwrap_or_default();
+    let response_message_id = response
+        .get_u16(tags::MESSAGE_ID_BEING_RESPONDED_TO)
+        .unwrap_or_default();
+    if command_field != 0x8001 || response_message_id != message_id {
+        return Err(dicom_toolkit_core::error::DcmError::Other(format!(
+            "expected C-STORE-RSP for message {message_id}, received command 0x{command_field:04X} for message {response_message_id}"
+        )));
+    }
+
+    Ok(CancellableStoreOutcome::Response(StoreResponse {
+        status: response.get_u16(tags::STATUS).unwrap_or(0xFFFF),
+        message_id,
+    }))
 }
 
 async fn send_store_source(

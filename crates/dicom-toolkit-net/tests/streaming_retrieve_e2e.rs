@@ -108,6 +108,26 @@ fn cancel_command(message_id_being_responded_to: u16) -> DataSet {
     command
 }
 
+fn successful_store_response(store_request: &DataSet) -> DataSet {
+    let mut response = DataSet::new();
+    response.set_uid(
+        tags::AFFECTED_SOP_CLASS_UID,
+        store_request
+            .get_string(tags::AFFECTED_SOP_CLASS_UID)
+            .expect("C-STORE SOP Class UID"),
+    );
+    response.set_u16(tags::COMMAND_FIELD, 0x8001);
+    response.set_u16(
+        tags::MESSAGE_ID_BEING_RESPONDED_TO,
+        store_request
+            .get_u16(tags::MESSAGE_ID)
+            .expect("C-STORE message ID"),
+    );
+    response.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0101);
+    response.set_u16(tags::STATUS, 0x0000);
+    response
+}
+
 fn move_request_command(message_id: u16, destination: &str) -> DataSet {
     let mut command = DataSet::new();
     command.set_uid(
@@ -446,7 +466,7 @@ async fn matching_move_cancel_drops_a_pending_provider_stream() {
 }
 
 #[tokio::test]
-async fn cancel_during_a_large_file_stream_finishes_the_pdv_and_stops_early() {
+async fn cancel_during_c_get_finishes_the_current_store_before_returning_cancel() {
     const DATASET_LENGTH: u64 = 32 * 1024 * 1024;
     let temporary_file = tempfile::NamedTempFile::new().expect("create temporary file");
     temporary_file
@@ -458,12 +478,20 @@ async fn cancel_during_a_large_file_stream_finishes_the_pdv_and_stops_early() {
         .ae_title("GETSCP")
         .port(0)
         .streaming_get_provider(FixedStreamingGetProvider {
-            items: vec![StreamingRetrieveItem {
-                sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
-                sop_instance_uid: sop_instance_uid.to_string(),
-                transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
-                dataset: DatasetSource::file_region(temporary_file.path(), 0, DATASET_LENGTH),
-            }],
+            items: vec![
+                StreamingRetrieveItem {
+                    sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+                    sop_instance_uid: sop_instance_uid.to_string(),
+                    transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                    dataset: DatasetSource::file_region(temporary_file.path(), 0, DATASET_LENGTH),
+                },
+                StreamingRetrieveItem {
+                    sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+                    sop_instance_uid: "1.2.826.0.1.5".to_string(),
+                    transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                    dataset: DatasetSource::bytes(encoded_instance("1.2.826.0.1.5")),
+                },
+            ],
         })
         .build()
         .await
@@ -497,7 +525,7 @@ async fn cancel_during_a_large_file_stream_finishes_the_pdv_and_stops_early() {
         .await
         .expect("send identifier");
 
-    let (_, store_request) = association
+    let (store_context_id, store_request) = association
         .recv_dimse_command()
         .await
         .expect("receive C-STORE-RQ");
@@ -506,14 +534,15 @@ async fn cancel_during_a_large_file_stream_finishes_the_pdv_and_stops_early() {
         .send_dimse_command(query_context_id, &cancel_command(retrieve_message_id))
         .await
         .expect("send C-CANCEL-RQ");
-    let partial_dataset = association
+    let complete_dataset = association
         .recv_dimse_data()
         .await
-        .expect("receive syntactically complete partial dataset stream");
-    assert!(
-        partial_dataset.len() < DATASET_LENGTH as usize,
-        "cancellation must stop the current dataset before reading the complete file"
-    );
+        .expect("receive complete current C-STORE dataset");
+    assert_eq!(complete_dataset.len(), DATASET_LENGTH as usize);
+    association
+        .send_dimse_command(store_context_id, &successful_store_response(&store_request))
+        .await
+        .expect("send C-STORE-RSP after complete dataset");
 
     let (_, final_response) = association
         .recv_dimse_command()
@@ -521,15 +550,111 @@ async fn cancel_during_a_large_file_stream_finishes_the_pdv_and_stops_early() {
         .expect("receive final C-GET-RSP");
     assert_eq!(final_response.get_u16(tags::STATUS), Some(STATUS_CANCEL));
     assert_eq!(
-        final_response.get_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS),
+        final_response.get_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS),
         Some(1)
     );
-    if final_response.get_u16(tags::COMMAND_DATA_SET_TYPE) != Some(0x0101) {
-        association
-            .recv_dimse_data()
-            .await
-            .expect("receive failed UID list");
-    }
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS),
+        Some(1)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS),
+        Some(0)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::COMMAND_DATA_SET_TYPE),
+        Some(0x0101),
+        "an empty Failed SOP Instance UID List must be absent"
+    );
+
+    association.release().await.expect("release");
+    cancellation_token.cancel();
+    server_task.await.expect("server task").expect("server run");
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_store_response_still_accounts_that_response() {
+    let sop_instance_uid = "1.2.826.0.1.6";
+    let encoded_dataset = encoded_instance(sop_instance_uid);
+    let expected_dataset = encoded_dataset.clone();
+    let server = DicomServer::builder()
+        .ae_title("GETSCP")
+        .port(0)
+        .streaming_get_provider(FixedStreamingGetProvider {
+            items: vec![StreamingRetrieveItem {
+                sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+                sop_instance_uid: sop_instance_uid.to_string(),
+                transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                dataset: DatasetSource::bytes(encoded_dataset),
+            }],
+        })
+        .build()
+        .await
+        .expect("build server");
+    let address = loopback_address(server.local_addr().expect("local address"));
+    let cancellation_token = server.cancellation_token();
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    let mut association = Association::request_with_options(
+        &address.to_string(),
+        "GETSCP",
+        "GETSCU",
+        &[query_retrieve_get_context(1), storage_context(3)],
+        &AssociationConfig::default(),
+        &requestor_options(),
+    )
+    .await
+    .expect("associate");
+    let query_context_id = association
+        .find_context(sop_class::PATIENT_ROOT_QR_GET)
+        .expect("query context")
+        .id;
+    let retrieve_message_id = 44;
+    association
+        .send_dimse_command(query_context_id, &get_request_command(retrieve_message_id))
+        .await
+        .expect("send C-GET-RQ");
+    association
+        .send_dimse_data(query_context_id, &query_identifier())
+        .await
+        .expect("send identifier");
+
+    let (store_context_id, store_request) = association
+        .recv_dimse_command()
+        .await
+        .expect("receive C-STORE-RQ");
+    let received_dataset = association
+        .recv_dimse_data()
+        .await
+        .expect("receive complete C-STORE dataset");
+    assert_eq!(received_dataset, expected_dataset);
+
+    association
+        .send_dimse_command(query_context_id, &cancel_command(retrieve_message_id))
+        .await
+        .expect("send C-CANCEL-RQ while SCP awaits C-STORE-RSP");
+    association
+        .send_dimse_command(store_context_id, &successful_store_response(&store_request))
+        .await
+        .expect("send matching C-STORE-RSP");
+
+    let (_, final_response) = association
+        .recv_dimse_command()
+        .await
+        .expect("receive final C-GET-RSP");
+    assert_eq!(final_response.get_u16(tags::STATUS), Some(STATUS_CANCEL));
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS),
+        Some(0)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS),
+        Some(1)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::COMMAND_DATA_SET_TYPE),
+        Some(0x0101)
+    );
 
     association.release().await.expect("release");
     cancellation_token.cancel();
