@@ -379,6 +379,8 @@ dependencies = [
  "dicom-toolkit-core",
  "dicom-toolkit-data",
  "dicom-toolkit-dict",
+ "futures-core",
+ "futures-util",
  "proptest",
  "rustls",
  "rustls-pemfile",

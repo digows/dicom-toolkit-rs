@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -34,15 +35,17 @@ use dicom_toolkit_data::{DataSet, FileFormat};
 use dicom_toolkit_dict::tags;
 
 use crate::association::Association;
-use crate::config::AssociationConfig;
-use crate::services::find::handle_find_rq;
-use crate::services::get::handle_get_rq;
+use crate::config::{AssociationConfig, AssociationOptions};
+use crate::services::find::{handle_find_rq, handle_streaming_find_rq};
+use crate::services::get::{handle_get_rq, handle_streaming_get_rq};
 use crate::services::provider::{
-    DestinationLookup, FindEvent, FindServiceProvider, GetEvent, GetServiceProvider, MoveEvent,
-    MoveServiceProvider, RetrieveItem, StaticDestinationLookup, StoreEvent, StoreResult,
-    StoreServiceProvider, STATUS_UNRECOGNISED_OPERATION,
+    DestinationLookup, FindEvent, FindResponseStream, FindServiceProvider, GetEvent,
+    GetRetrievePlan, GetServiceProvider, MoveEvent, MoveRetrievePlan, MoveServiceProvider,
+    RetrieveItem, StaticDestinationLookup, StoreEvent, StoreResult, StoreServiceProvider,
+    StreamingFindServiceProvider, StreamingGetServiceProvider, StreamingMoveServiceProvider,
+    STATUS_UNRECOGNISED_OPERATION,
 };
-use crate::services::r#move::handle_move_rq;
+use crate::services::r#move::{handle_move_rq, handle_streaming_move_rq};
 use crate::services::store::handle_store_rq;
 
 // ── Service registry ──────────────────────────────────────────────────────────
@@ -50,9 +53,9 @@ use crate::services::store::handle_store_rq;
 /// Holds optional provider implementations for each DIMSE service.
 struct ServiceRegistry {
     store: Option<Arc<dyn AnyStoreProvider>>,
-    find: Option<Arc<dyn AnyFindProvider>>,
-    get: Option<Arc<dyn AnyGetProvider>>,
-    r#move: Option<Arc<dyn AnyMoveProvider>>,
+    find: Option<FindProviderRegistration>,
+    get: Option<GetProviderRegistration>,
+    r#move: Option<MoveProviderRegistration>,
     dest_lookup: Arc<dyn DestinationLookup>,
     local_ae: String,
 }
@@ -95,6 +98,26 @@ impl<P: FindServiceProvider> AnyFindProvider for P {
     }
 }
 
+trait AnyStreamingFindProvider: Send + Sync + 'static {
+    fn on_find_stream<'a>(
+        &'a self,
+        event: FindEvent,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = DcmResult<FindResponseStream>> + Send + 'a>,
+    >;
+}
+
+impl<P: StreamingFindServiceProvider> AnyStreamingFindProvider for P {
+    fn on_find_stream<'a>(
+        &'a self,
+        event: FindEvent,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = DcmResult<FindResponseStream>> + Send + 'a>,
+    > {
+        Box::pin(StreamingFindServiceProvider::on_find_stream(self, event))
+    }
+}
+
 trait AnyGetProvider: Send + Sync + 'static {
     fn on_get<'a>(
         &'a self,
@@ -108,6 +131,23 @@ impl<P: GetServiceProvider> AnyGetProvider for P {
         event: GetEvent,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<RetrieveItem>> + Send + 'a>> {
         Box::pin(GetServiceProvider::on_get(self, event))
+    }
+}
+
+trait AnyStreamingGetProvider: Send + Sync + 'static {
+    fn on_get_stream<'a>(
+        &'a self,
+        event: GetEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DcmResult<GetRetrievePlan>> + Send + 'a>>;
+}
+
+impl<P: StreamingGetServiceProvider> AnyStreamingGetProvider for P {
+    fn on_get_stream<'a>(
+        &'a self,
+        event: GetEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DcmResult<GetRetrievePlan>> + Send + 'a>>
+    {
+        Box::pin(StreamingGetServiceProvider::on_get_stream(self, event))
     }
 }
 
@@ -127,6 +167,38 @@ impl<P: MoveServiceProvider> AnyMoveProvider for P {
     }
 }
 
+trait AnyStreamingMoveProvider: Send + Sync + 'static {
+    fn on_move_stream<'a>(
+        &'a self,
+        event: MoveEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DcmResult<MoveRetrievePlan>> + Send + 'a>>;
+}
+
+impl<P: StreamingMoveServiceProvider> AnyStreamingMoveProvider for P {
+    fn on_move_stream<'a>(
+        &'a self,
+        event: MoveEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DcmResult<MoveRetrievePlan>> + Send + 'a>>
+    {
+        Box::pin(StreamingMoveServiceProvider::on_move_stream(self, event))
+    }
+}
+
+enum FindProviderRegistration {
+    Legacy(Arc<dyn AnyFindProvider>),
+    Streaming(Arc<dyn AnyStreamingFindProvider>),
+}
+
+enum GetProviderRegistration {
+    Legacy(Arc<dyn AnyGetProvider>),
+    Streaming(Arc<dyn AnyStreamingGetProvider>),
+}
+
+enum MoveProviderRegistration {
+    Legacy(Arc<dyn AnyMoveProvider>),
+    Streaming(Arc<dyn AnyStreamingMoveProvider>),
+}
+
 // ── Type-erased adapters for SCP handler functions ────────────────────────────
 
 struct DynStoreAdapter(Arc<dyn AnyStoreProvider>);
@@ -143,6 +215,13 @@ impl FindServiceProvider for DynFindAdapter {
     }
 }
 
+struct DynStreamingFindAdapter(Arc<dyn AnyStreamingFindProvider>);
+impl StreamingFindServiceProvider for DynStreamingFindAdapter {
+    async fn on_find_stream(&self, event: FindEvent) -> DcmResult<FindResponseStream> {
+        self.0.on_find_stream(event).await
+    }
+}
+
 struct DynGetAdapter(Arc<dyn AnyGetProvider>);
 impl GetServiceProvider for DynGetAdapter {
     async fn on_get(&self, event: GetEvent) -> Vec<RetrieveItem> {
@@ -150,10 +229,24 @@ impl GetServiceProvider for DynGetAdapter {
     }
 }
 
+struct DynStreamingGetAdapter(Arc<dyn AnyStreamingGetProvider>);
+impl StreamingGetServiceProvider for DynStreamingGetAdapter {
+    async fn on_get_stream(&self, event: GetEvent) -> DcmResult<GetRetrievePlan> {
+        self.0.on_get_stream(event).await
+    }
+}
+
 struct DynMoveAdapter(Arc<dyn AnyMoveProvider>);
 impl MoveServiceProvider for DynMoveAdapter {
     async fn on_move(&self, event: MoveEvent) -> Vec<RetrieveItem> {
         self.0.on_move(event).await
+    }
+}
+
+struct DynStreamingMoveAdapter(Arc<dyn AnyStreamingMoveProvider>);
+impl StreamingMoveServiceProvider for DynStreamingMoveAdapter {
+    async fn on_move_stream(&self, event: MoveEvent) -> DcmResult<MoveRetrievePlan> {
+        self.0.on_move_stream(event).await
     }
 }
 
@@ -168,7 +261,12 @@ pub struct DicomServer {
     listener: TcpListener,
     registry: Arc<ServiceRegistry>,
     config: Arc<AssociationConfig>,
+    association_options: Arc<AssociationOptions>,
+    use_association_options: bool,
+    move_destination_config: Arc<AssociationConfig>,
+    move_destination_options: Arc<AssociationOptions>,
     max_associations: usize,
+    graceful_shutdown_timeout: Option<Duration>,
     token: CancellationToken,
 }
 
@@ -189,7 +287,11 @@ impl DicomServer {
         self.token.clone()
     }
 
-    /// Stop the server gracefully.  In-flight associations complete normally.
+    /// Stop accepting new connections.
+    ///
+    /// Active associations are detached by default. Configure
+    /// [`DicomServerBuilder::graceful_shutdown_timeout`] to drain them for a
+    /// bounded period instead.
     pub fn shutdown(&self) {
         self.token.cancel();
     }
@@ -200,6 +302,7 @@ impl DicomServer {
     /// fails.
     pub async fn run(self) -> DcmResult<()> {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_associations));
+        let mut connection_tasks = tokio::task::JoinSet::new();
         info!(
             ae = %self.registry.local_ae,
             addr = ?self.listener.local_addr(),
@@ -230,10 +333,24 @@ impl DicomServer {
 
                             let registry = Arc::clone(&self.registry);
                             let config = Arc::clone(&self.config);
+                            let association_options = Arc::clone(&self.association_options);
+                            let use_association_options = self.use_association_options;
+                            let move_destination_config = Arc::clone(&self.move_destination_config);
+                            let move_destination_options = Arc::clone(&self.move_destination_options);
 
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
                                 let _permit = permit;
-                                match handle_connection(stream, &registry, &config).await {
+                                match handle_connection(
+                                    stream,
+                                    &registry,
+                                    &config,
+                                    &association_options,
+                                    use_association_options,
+                                    &move_destination_config,
+                                    &move_destination_options,
+                                )
+                                .await
+                                {
                                     Ok(()) => {}
                                     Err(e) => {
                                         warn!(%peer_addr, "connection error: {}", e);
@@ -243,7 +360,35 @@ impl DicomServer {
                         }
                     }
                 }
+                result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        warn!(%error, "DICOM connection task failed");
+                    }
+                }
             }
+        }
+
+        let Some(graceful_shutdown_timeout) = self.graceful_shutdown_timeout else {
+            connection_tasks.detach_all();
+            return Ok(());
+        };
+
+        let drain_connections = async {
+            while let Some(result) = connection_tasks.join_next().await {
+                if let Err(error) = result {
+                    warn!(%error, "DICOM connection task failed while draining");
+                }
+            }
+        };
+        if tokio::time::timeout(graceful_shutdown_timeout, drain_connections)
+            .await
+            .is_err()
+        {
+            warn!(
+                timeout_seconds = graceful_shutdown_timeout.as_secs(),
+                "graceful shutdown timed out; aborting remaining associations"
+            );
+            connection_tasks.shutdown().await;
         }
         Ok(())
     }
@@ -255,13 +400,21 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     registry: &ServiceRegistry,
     config: &AssociationConfig,
+    association_options: &AssociationOptions,
+    use_association_options: bool,
+    move_destination_config: &AssociationConfig,
+    move_destination_options: &AssociationOptions,
 ) -> DcmResult<()> {
     let peer = stream.peer_addr().ok();
     if let Some(addr) = peer {
         info!(%addr, "association accepted");
     }
 
-    let mut assoc = Association::accept(stream, config).await?;
+    let mut assoc = if use_association_options {
+        Association::accept_with_options(stream, config, association_options).await?
+    } else {
+        Association::accept(stream, config).await?
+    };
 
     loop {
         let (ctx_id, cmd) = match assoc.recv_dimse_command().await {
@@ -302,8 +455,16 @@ async fn handle_connection(
             // C-FIND-RQ
             0x0020 => {
                 if let Some(provider) = &registry.find {
-                    let adapter = DynFindAdapter(Arc::clone(provider));
-                    handle_find_rq(&mut assoc, ctx_id, &cmd, &adapter).await?;
+                    match provider {
+                        FindProviderRegistration::Legacy(provider) => {
+                            let adapter = DynFindAdapter(Arc::clone(provider));
+                            handle_find_rq(&mut assoc, ctx_id, &cmd, &adapter).await?;
+                        }
+                        FindProviderRegistration::Streaming(provider) => {
+                            let adapter = DynStreamingFindAdapter(Arc::clone(provider));
+                            handle_streaming_find_rq(&mut assoc, ctx_id, &cmd, &adapter).await?;
+                        }
+                    }
                 } else {
                     send_refused(&mut assoc, ctx_id, &cmd, 0x8020).await?;
                 }
@@ -312,8 +473,16 @@ async fn handle_connection(
             // C-GET-RQ
             0x0010 => {
                 if let Some(provider) = &registry.get {
-                    let adapter = DynGetAdapter(Arc::clone(provider));
-                    handle_get_rq(&mut assoc, ctx_id, &cmd, &adapter).await?;
+                    match provider {
+                        GetProviderRegistration::Legacy(provider) => {
+                            let adapter = DynGetAdapter(Arc::clone(provider));
+                            handle_get_rq(&mut assoc, ctx_id, &cmd, &adapter).await?;
+                        }
+                        GetProviderRegistration::Streaming(provider) => {
+                            let adapter = DynStreamingGetAdapter(Arc::clone(provider));
+                            handle_streaming_get_rq(&mut assoc, ctx_id, &cmd, &adapter).await?;
+                        }
+                    }
                 } else {
                     send_refused(&mut assoc, ctx_id, &cmd, 0x8010).await?;
                 }
@@ -322,19 +491,43 @@ async fn handle_connection(
             // C-MOVE-RQ
             0x0021 => {
                 if let Some(provider) = &registry.r#move {
-                    let adapter = DynMoveAdapter(Arc::clone(provider));
-                    handle_move_rq(
-                        &mut assoc,
-                        ctx_id,
-                        &cmd,
-                        &adapter,
-                        registry.dest_lookup.as_ref(),
-                        &registry.local_ae,
-                    )
-                    .await?;
+                    match provider {
+                        MoveProviderRegistration::Legacy(provider) => {
+                            let adapter = DynMoveAdapter(Arc::clone(provider));
+                            handle_move_rq(
+                                &mut assoc,
+                                ctx_id,
+                                &cmd,
+                                &adapter,
+                                registry.dest_lookup.as_ref(),
+                                &registry.local_ae,
+                            )
+                            .await?;
+                        }
+                        MoveProviderRegistration::Streaming(provider) => {
+                            let adapter = DynStreamingMoveAdapter(Arc::clone(provider));
+                            handle_streaming_move_rq(
+                                &mut assoc,
+                                ctx_id,
+                                &cmd,
+                                &adapter,
+                                registry.dest_lookup.as_ref(),
+                                &registry.local_ae,
+                                move_destination_config,
+                                move_destination_options,
+                            )
+                            .await?;
+                        }
+                    }
                 } else {
                     send_refused(&mut assoc, ctx_id, &cmd, 0x8021).await?;
                 }
+            }
+
+            // A response from a C-STORE interrupted by C-CANCEL may arrive
+            // after the final retrieve response. It is already accounted for.
+            0x8001 | 0x0FFF => {
+                warn!(command_field, "ignoring stale DIMSE response or cancel");
             }
 
             _ => {
@@ -345,7 +538,6 @@ async fn handle_connection(
         }
     }
 
-    let _ = assoc.release().await;
     Ok(())
 }
 
@@ -379,11 +571,15 @@ pub struct DicomServerBuilder {
     ae_title: String,
     port: u16,
     max_associations: usize,
+    graceful_shutdown_timeout: Option<Duration>,
     config: Option<AssociationConfig>,
+    association_options: Option<AssociationOptions>,
+    move_destination_config: Option<AssociationConfig>,
+    move_destination_options: Option<AssociationOptions>,
     store: Option<Arc<dyn AnyStoreProvider>>,
-    find: Option<Arc<dyn AnyFindProvider>>,
-    get: Option<Arc<dyn AnyGetProvider>>,
-    r#move: Option<Arc<dyn AnyMoveProvider>>,
+    find: Option<FindProviderRegistration>,
+    get: Option<GetProviderRegistration>,
+    r#move: Option<MoveProviderRegistration>,
     dest_lookup: Option<Arc<dyn DestinationLookup>>,
 }
 
@@ -393,7 +589,11 @@ impl Default for DicomServerBuilder {
             ae_title: "DICOMRS".to_string(),
             port: 4242,
             max_associations: 100,
+            graceful_shutdown_timeout: None,
             config: None,
+            association_options: None,
+            move_destination_config: None,
+            move_destination_options: None,
             store: None,
             find: None,
             get: None,
@@ -422,9 +622,39 @@ impl DicomServerBuilder {
         self
     }
 
+    /// Set how long shutdown waits for active associations before aborting them.
+    ///
+    /// Without this option, active association tasks remain detached on
+    /// shutdown, preserving the legacy server behavior.
+    pub fn graceful_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.graceful_shutdown_timeout = Some(timeout);
+        self
+    }
+
     /// Override the full [`AssociationConfig`].
     pub fn config(mut self, cfg: AssociationConfig) -> Self {
         self.config = Some(cfg);
+        self
+    }
+
+    /// Configure bounded resources and extended association negotiation.
+    pub fn association_options(mut self, options: AssociationOptions) -> Self {
+        self.association_options = Some(options);
+        self
+    }
+
+    /// Override the association configuration used for C-MOVE destinations.
+    ///
+    /// This is separate from the inbound SCP configuration because requestor
+    /// role selections and asynchronous-operation proposals are directional.
+    pub fn move_destination_config(mut self, config: AssociationConfig) -> Self {
+        self.move_destination_config = Some(config);
+        self
+    }
+
+    /// Configure bounded resources for C-MOVE destination associations.
+    pub fn move_destination_options(mut self, options: AssociationOptions) -> Self {
+        self.move_destination_options = Some(options);
         self
     }
 
@@ -436,19 +666,37 @@ impl DicomServerBuilder {
 
     /// Register a C-FIND provider.
     pub fn find_provider(mut self, p: impl FindServiceProvider) -> Self {
-        self.find = Some(Arc::new(p));
+        self.find = Some(FindProviderRegistration::Legacy(Arc::new(p)));
+        self
+    }
+
+    /// Register a lazy, fallible C-FIND provider.
+    pub fn streaming_find_provider(mut self, provider: impl StreamingFindServiceProvider) -> Self {
+        self.find = Some(FindProviderRegistration::Streaming(Arc::new(provider)));
         self
     }
 
     /// Register a C-GET provider.
     pub fn get_provider(mut self, p: impl GetServiceProvider) -> Self {
-        self.get = Some(Arc::new(p));
+        self.get = Some(GetProviderRegistration::Legacy(Arc::new(p)));
+        self
+    }
+
+    /// Register a bounded-source C-GET provider.
+    pub fn streaming_get_provider(mut self, provider: impl StreamingGetServiceProvider) -> Self {
+        self.get = Some(GetProviderRegistration::Streaming(Arc::new(provider)));
         self
     }
 
     /// Register a C-MOVE provider.
     pub fn move_provider(mut self, p: impl MoveServiceProvider) -> Self {
-        self.r#move = Some(Arc::new(p));
+        self.r#move = Some(MoveProviderRegistration::Legacy(Arc::new(p)));
+        self
+    }
+
+    /// Register a bounded-source C-MOVE provider.
+    pub fn streaming_move_provider(mut self, provider: impl StreamingMoveServiceProvider) -> Self {
+        self.r#move = Some(MoveProviderRegistration::Streaming(Arc::new(provider)));
         self
     }
 
@@ -471,6 +719,59 @@ impl DicomServerBuilder {
             ..Default::default()
         });
 
+        let has_streaming_get = matches!(
+            self.get.as_ref(),
+            Some(GetProviderRegistration::Streaming(_))
+        );
+        let uses_streaming_provider = matches!(
+            self.find.as_ref(),
+            Some(FindProviderRegistration::Streaming(_))
+        ) || has_streaming_get
+            || matches!(
+                self.r#move.as_ref(),
+                Some(MoveProviderRegistration::Streaming(_))
+            );
+        let use_association_options = uses_streaming_provider || self.association_options.is_some();
+        let mut association_options = self.association_options.unwrap_or_else(|| {
+            if uses_streaming_provider {
+                AssociationOptions::default()
+            } else {
+                AssociationOptions {
+                    maximum_incoming_pdu_length: 0,
+                    maximum_outgoing_pdu_length: 0,
+                    ..AssociationOptions::default()
+                }
+            }
+        });
+
+        if association_options
+            .maximum_asynchronous_operations_window
+            .invoked
+            != 1
+            || association_options
+                .maximum_asynchronous_operations_window
+                .performed
+                != 1
+        {
+            return Err(dicom_toolkit_core::error::DcmError::Other(
+                "DicomServer currently supports only the synchronous asynchronous-operations window (1, 1)"
+                    .into(),
+            ));
+        }
+
+        if has_streaming_get {
+            association_options.accept_requestor_scp_role = true;
+        }
+
+        let move_destination_config = self
+            .move_destination_config
+            .unwrap_or_else(|| config.clone());
+        let move_destination_options = self.move_destination_options.unwrap_or_else(|| {
+            let mut destination_options = association_options.clone();
+            destination_options.requested_role_selections.clear();
+            destination_options
+        });
+
         let listener = TcpListener::bind(("0.0.0.0", self.port)).await?;
 
         let dest_lookup: Arc<dyn DestinationLookup> = self
@@ -490,7 +791,12 @@ impl DicomServerBuilder {
             listener,
             registry,
             config: Arc::new(config),
+            association_options: Arc::new(association_options),
+            use_association_options,
+            move_destination_config: Arc::new(move_destination_config),
+            move_destination_options: Arc::new(move_destination_options),
             max_associations: self.max_associations,
+            graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             token: CancellationToken::new(),
         })
     }
@@ -529,30 +835,42 @@ impl FileStoreProvider {
 
 impl StoreServiceProvider for FileStoreProvider {
     async fn on_store(&self, event: StoreEvent) -> StoreResult {
-        let ff =
-            FileFormat::from_dataset(&event.sop_class_uid, &event.sop_instance_uid, event.dataset);
+        let destination_directory = self.dir.clone();
+        let StoreEvent {
+            sop_class_uid,
+            sop_instance_uid,
+            dataset,
+            ..
+        } = event;
 
-        let safe: String = event
-            .sop_instance_uid
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let result = tokio::task::spawn_blocking(move || {
+            let file_format = FileFormat::from_dataset(&sop_class_uid, &sop_instance_uid, dataset);
+            let safe_instance_uid: String = sop_instance_uid
+                .chars()
+                .map(|character| {
+                    if character.is_alphanumeric() || character == '.' {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let destination = destination_directory.join(format!("{safe_instance_uid}.dcm"));
+            file_format.save(&destination).map(|()| destination)
+        })
+        .await;
 
-        let dest = self.dir.join(format!("{safe}.dcm"));
-
-        match ff.save(&dest) {
-            Ok(()) => {
-                info!(path = %dest.display(), "stored instance");
+        match result {
+            Ok(Ok(destination)) => {
+                info!(path = %destination.display(), "stored instance");
                 StoreResult::success()
             }
-            Err(e) => {
-                error!(path = %dest.display(), error = %e, "failed to save instance");
+            Ok(Err(error)) => {
+                error!(%error, "failed to save instance");
+                StoreResult::failure(crate::services::provider::STATUS_PROCESSING_FAILURE)
+            }
+            Err(error) => {
+                error!(%error, "file store worker failed");
                 StoreResult::failure(crate::services::provider::STATUS_PROCESSING_FAILURE)
             }
         }
