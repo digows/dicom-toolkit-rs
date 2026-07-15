@@ -20,9 +20,6 @@ pub const PDU_RELEASE_RQ: u8 = 0x05;
 pub const PDU_RELEASE_RP: u8 = 0x06;
 pub const PDU_A_ABORT: u8 = 0x07;
 
-/// Default safety limit for the variable field of a received PDU.
-pub const DEFAULT_MAXIMUM_INCOMING_PDU_LENGTH: u32 = 16 * 1024 * 1024;
-
 // ── Sub-item type constants ───────────────────────────────────────────────────
 
 const ITEM_APPLICATION_CONTEXT: u8 = 0x10;
@@ -33,8 +30,8 @@ const ITEM_TRANSFER_SYNTAX: u8 = 0x40;
 const ITEM_USER_INFORMATION: u8 = 0x50;
 const ITEM_MAX_PDU_LENGTH: u8 = 0x51;
 const ITEM_IMPLEMENTATION_CLASS_UID: u8 = 0x52;
+#[allow(dead_code)]
 const ITEM_ASYNC_OPS_WINDOW: u8 = 0x53;
-const ITEM_SCP_SCU_ROLE_SELECTION: u8 = 0x54;
 const ITEM_IMPLEMENTATION_VERSION_NAME: u8 = 0x55;
 
 // ── PDU struct types ──────────────────────────────────────────────────────────
@@ -57,38 +54,6 @@ pub struct PresentationContextAcItem {
     pub transfer_syntax: String,
 }
 
-/// Maximum outstanding DIMSE operations in each direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AsynchronousOperationsWindow {
-    /// Maximum number of operations this association participant may invoke.
-    pub invoked: u16,
-    /// Maximum number of operations this association participant may perform.
-    pub performed: u16,
-}
-
-impl Default for AsynchronousOperationsWindow {
-    fn default() -> Self {
-        Self {
-            invoked: 1,
-            performed: 1,
-        }
-    }
-}
-
-/// Proposed or accepted roles for one SOP Class.
-///
-/// The flags always describe the association requestor's roles, including
-/// when this value is carried in A-ASSOCIATE-AC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScpScuRoleSelection {
-    /// SOP Class UID to which the role selection applies.
-    pub sop_class_uid: String,
-    /// Whether the association requestor may act as SCU.
-    pub scu_role: bool,
-    /// Whether the association requestor may act as SCP.
-    pub scp_role: bool,
-}
-
 /// A-ASSOCIATE-RQ PDU body.
 #[derive(Debug, Clone)]
 pub struct AssociateRq {
@@ -99,10 +64,6 @@ pub struct AssociateRq {
     pub max_pdu_length: u32,
     pub implementation_class_uid: String,
     pub implementation_version_name: String,
-    /// Optional asynchronous operations window proposed by the requestor.
-    pub asynchronous_operations_window: Option<AsynchronousOperationsWindow>,
-    /// Optional SOP Class role selections proposed by the requestor.
-    pub role_selections: Vec<ScpScuRoleSelection>,
 }
 
 /// A-ASSOCIATE-AC PDU body.
@@ -115,10 +76,6 @@ pub struct AssociateAc {
     pub max_pdu_length: u32,
     pub implementation_class_uid: String,
     pub implementation_version_name: String,
-    /// Negotiated asynchronous operations window, if it was proposed.
-    pub asynchronous_operations_window: Option<AsynchronousOperationsWindow>,
-    /// Accepted requestor roles for proposed SOP Classes.
-    pub role_selections: Vec<ScpScuRoleSelection>,
 }
 
 /// A-ASSOCIATE-RJ PDU body.
@@ -250,13 +207,7 @@ fn encode_presentation_context_ac(pc: &PresentationContextAcItem) -> Vec<u8> {
     buf
 }
 
-fn encode_user_information(
-    max_pdu: u32,
-    impl_uid: &str,
-    impl_version: &str,
-    asynchronous_operations_window: Option<AsynchronousOperationsWindow>,
-    role_selections: &[ScpScuRoleSelection],
-) -> Vec<u8> {
+fn encode_user_information(max_pdu: u32, impl_uid: &str, impl_version: &str) -> Vec<u8> {
     let mut user_data = Vec::new();
 
     // Max PDU Length sub-item (0x51)
@@ -270,27 +221,6 @@ fn encode_user_information(
         ITEM_IMPLEMENTATION_CLASS_UID,
         impl_uid,
     ));
-
-    if let Some(window) = asynchronous_operations_window {
-        user_data.push(ITEM_ASYNC_OPS_WINDOW);
-        user_data.push(0);
-        user_data.extend_from_slice(&4u16.to_be_bytes());
-        user_data.extend_from_slice(&window.invoked.to_be_bytes());
-        user_data.extend_from_slice(&window.performed.to_be_bytes());
-    }
-
-    for role in role_selections {
-        let uid_bytes = role.sop_class_uid.as_bytes();
-        let item_length = u16::try_from(uid_bytes.len().saturating_add(4)).unwrap_or(u16::MAX);
-        let uid_length = u16::try_from(uid_bytes.len()).unwrap_or(u16::MAX);
-        user_data.push(ITEM_SCP_SCU_ROLE_SELECTION);
-        user_data.push(0);
-        user_data.extend_from_slice(&item_length.to_be_bytes());
-        user_data.extend_from_slice(&uid_length.to_be_bytes());
-        user_data.extend_from_slice(uid_bytes);
-        user_data.push(u8::from(role.scu_role));
-        user_data.push(u8::from(role.scp_role));
-    }
 
     // Implementation Version Name (0x55), only if non-empty
     if !impl_version.is_empty() {
@@ -345,8 +275,6 @@ pub fn encode_associate_rq(rq: &AssociateRq) -> Vec<u8> {
         rq.max_pdu_length,
         &rq.implementation_class_uid,
         &rq.implementation_version_name,
-        rq.asynchronous_operations_window,
-        &rq.role_selections,
     ));
     raw_pdu(PDU_ASSOCIATE_RQ, &body)
 }
@@ -367,8 +295,6 @@ pub fn encode_associate_ac(ac: &AssociateAc) -> Vec<u8> {
         ac.max_pdu_length,
         &ac.implementation_class_uid,
         &ac.implementation_version_name,
-        ac.asynchronous_operations_window,
-        &ac.role_selections,
     ));
     raw_pdu(PDU_ASSOCIATE_AC, &body)
 }
@@ -472,29 +398,10 @@ fn decode_pc_ac(data: &[u8]) -> DcmResult<PresentationContextAcItem> {
     })
 }
 
-#[derive(Debug)]
-struct DecodedUserInformation {
-    max_pdu_length: u32,
-    implementation_class_uid: String,
-    implementation_version_name: String,
-    asynchronous_operations_window: Option<AsynchronousOperationsWindow>,
-    role_selections: Vec<ScpScuRoleSelection>,
-}
-
-impl Default for DecodedUserInformation {
-    fn default() -> Self {
-        Self {
-            max_pdu_length: 65_536,
-            implementation_class_uid: String::new(),
-            implementation_version_name: String::new(),
-            asynchronous_operations_window: None,
-            role_selections: Vec::new(),
-        }
-    }
-}
-
-fn decode_user_info(data: &[u8]) -> DcmResult<DecodedUserInformation> {
-    let mut user_information = DecodedUserInformation::default();
+fn decode_user_info(data: &[u8]) -> DcmResult<(u32, String, String)> {
+    let mut max_pdu = 65_536u32;
+    let mut impl_uid = String::new();
+    let mut impl_version = String::new();
 
     let mut pos = 0;
     while pos + 4 <= data.len() {
@@ -502,91 +409,46 @@ fn decode_user_info(data: &[u8]) -> DcmResult<DecodedUserInformation> {
         let item_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if pos + item_len > data.len() {
-            return Err(DcmError::Other(format!(
-                "user-information item 0x{item_type:02X} is truncated"
-            )));
+            break;
         }
         let item_data = &data[pos..pos + item_len];
         pos += item_len;
         match item_type {
-            ITEM_MAX_PDU_LENGTH if item_data.len() == 4 => {
-                user_information.max_pdu_length =
+            ITEM_MAX_PDU_LENGTH if item_data.len() >= 4 => {
+                max_pdu =
                     u32::from_be_bytes([item_data[0], item_data[1], item_data[2], item_data[3]]);
             }
-            ITEM_MAX_PDU_LENGTH => {
-                return Err(DcmError::Other(format!(
-                    "maximum PDU length item has invalid length {}",
-                    item_data.len()
-                )));
-            }
             ITEM_IMPLEMENTATION_CLASS_UID => {
-                user_information.implementation_class_uid = decode_uid_bytes(item_data);
-            }
-            ITEM_ASYNC_OPS_WINDOW if item_data.len() == 4 => {
-                user_information.asynchronous_operations_window =
-                    Some(AsynchronousOperationsWindow {
-                        invoked: u16::from_be_bytes([item_data[0], item_data[1]]),
-                        performed: u16::from_be_bytes([item_data[2], item_data[3]]),
-                    });
-            }
-            ITEM_ASYNC_OPS_WINDOW => {
-                return Err(DcmError::Other(format!(
-                    "asynchronous operations window has invalid length {}",
-                    item_data.len()
-                )));
-            }
-            ITEM_SCP_SCU_ROLE_SELECTION => {
-                if item_data.len() < 4 {
-                    return Err(DcmError::Other(
-                        "SCP/SCU role selection item is too short".into(),
-                    ));
-                }
-                let uid_length = u16::from_be_bytes([item_data[0], item_data[1]]) as usize;
-                let expected_length = uid_length.saturating_add(4);
-                if item_data.len() != expected_length {
-                    return Err(DcmError::Other(format!(
-                        "SCP/SCU role selection length mismatch: expected {expected_length}, got {}",
-                        item_data.len()
-                    )));
-                }
-                let scu_role = item_data[uid_length + 2];
-                let scp_role = item_data[uid_length + 3];
-                if scu_role > 1 || scp_role > 1 {
-                    return Err(DcmError::Other(
-                        "SCP/SCU role values must be zero or one".into(),
-                    ));
-                }
-                user_information.role_selections.push(ScpScuRoleSelection {
-                    sop_class_uid: decode_uid_bytes(&item_data[2..uid_length + 2]),
-                    scu_role: scu_role == 1,
-                    scp_role: scp_role == 1,
-                });
+                impl_uid = decode_uid_bytes(item_data);
             }
             ITEM_IMPLEMENTATION_VERSION_NAME => {
-                user_information.implementation_version_name =
-                    String::from_utf8_lossy(item_data).to_string();
+                impl_version = String::from_utf8_lossy(item_data).to_string();
             }
             _ => {}
         }
     }
-    Ok(user_information)
+    Ok((max_pdu, impl_uid, impl_version))
 }
 
 type SubItemsResult = (
     Vec<PresentationContextRqItem>,
     Vec<PresentationContextAcItem>,
     String,
-    DecodedUserInformation,
+    u32,
+    String,
+    String,
 );
 
 /// Decode the sub-items block common to both RQ and AC associate PDUs.
 ///
-/// Returns request contexts, accept contexts, application context, and user information.
+/// Returns `(rq_pcs, ac_pcs, app_context_uid, max_pdu, impl_class_uid, impl_version)`.
 fn decode_sub_items(data: &[u8]) -> DcmResult<SubItemsResult> {
     let mut rq_pcs = Vec::new();
     let mut ac_pcs = Vec::new();
     let mut app_context = String::new();
-    let mut user_information = DecodedUserInformation::default();
+    let mut max_pdu = 65_536u32;
+    let mut impl_uid = String::new();
+    let mut impl_version = String::new();
 
     let mut pos = 0;
     while pos + 4 <= data.len() {
@@ -615,12 +477,15 @@ fn decode_sub_items(data: &[u8]) -> DcmResult<SubItemsResult> {
                 ac_pcs.push(decode_pc_ac(item_data)?);
             }
             ITEM_USER_INFORMATION => {
-                user_information = decode_user_info(item_data)?;
+                let (m, u, v) = decode_user_info(item_data)?;
+                max_pdu = m;
+                impl_uid = u;
+                impl_version = v;
             }
             _ => {} // unknown sub-items are silently ignored per DICOM
         }
     }
-    Ok((rq_pcs, ac_pcs, app_context, user_information))
+    Ok((rq_pcs, ac_pcs, app_context, max_pdu, impl_uid, impl_version))
 }
 
 // ── Public decoding functions ─────────────────────────────────────────────────
@@ -636,17 +501,15 @@ pub fn decode_associate_rq(body: &[u8]) -> DcmResult<AssociateRq> {
     }
     let called = read_ae_title(&body[4..20]);
     let calling = read_ae_title(&body[20..36]);
-    let (rq_pcs, _, app_ctx, user_information) = decode_sub_items(&body[68..])?;
+    let (rq_pcs, _, app_ctx, max_pdu, impl_uid, impl_version) = decode_sub_items(&body[68..])?;
     Ok(AssociateRq {
         called_ae_title: called,
         calling_ae_title: calling,
         application_context: app_ctx,
         presentation_contexts: rq_pcs,
-        max_pdu_length: user_information.max_pdu_length,
-        implementation_class_uid: user_information.implementation_class_uid,
-        implementation_version_name: user_information.implementation_version_name,
-        asynchronous_operations_window: user_information.asynchronous_operations_window,
-        role_selections: user_information.role_selections,
+        max_pdu_length: max_pdu,
+        implementation_class_uid: impl_uid,
+        implementation_version_name: impl_version,
     })
 }
 
@@ -660,17 +523,15 @@ pub fn decode_associate_ac(body: &[u8]) -> DcmResult<AssociateAc> {
     }
     let called = read_ae_title(&body[4..20]);
     let calling = read_ae_title(&body[20..36]);
-    let (_, ac_pcs, app_ctx, user_information) = decode_sub_items(&body[68..])?;
+    let (_, ac_pcs, app_ctx, max_pdu, impl_uid, impl_version) = decode_sub_items(&body[68..])?;
     Ok(AssociateAc {
         called_ae_title: called,
         calling_ae_title: calling,
         application_context: app_ctx,
         presentation_contexts: ac_pcs,
-        max_pdu_length: user_information.max_pdu_length,
-        implementation_class_uid: user_information.implementation_class_uid,
-        implementation_version_name: user_information.implementation_version_name,
-        asynchronous_operations_window: user_information.asynchronous_operations_window,
-        role_selections: user_information.role_selections,
+        max_pdu_length: max_pdu,
+        implementation_class_uid: impl_uid,
+        implementation_version_name: impl_version,
     })
 }
 
@@ -729,28 +590,10 @@ pub fn decode_a_abort(body: &[u8]) -> AAbort {
 ///
 /// Reads the 6-byte header first, then the body.
 pub async fn read_pdu<R: AsyncRead + Unpin>(reader: &mut R) -> DcmResult<Pdu> {
-    read_pdu_with_limit(reader, DEFAULT_MAXIMUM_INCOMING_PDU_LENGTH).await
-}
-
-/// Read and decode a complete PDU while enforcing a variable-field limit.
-///
-/// The limit is checked before allocating the body buffer. It refers to the
-/// four-byte PDU-length field and therefore excludes the six-byte PDU header.
-pub async fn read_pdu_with_limit<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    maximum_pdu_length: u32,
-) -> DcmResult<Pdu> {
     let mut header = [0u8; 6];
     reader.read_exact(&mut header).await?;
     let pdu_type = header[0];
-    let body_length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
-    if body_length > maximum_pdu_length {
-        return Err(DcmError::PduLengthExceeded {
-            length: body_length,
-            maximum: maximum_pdu_length,
-        });
-    }
-    let body_len = body_length as usize;
+    let body_len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
     let mut body = vec![0u8; body_len];
     reader.read_exact(&mut body).await?;
 
@@ -771,33 +614,6 @@ pub async fn read_pdu_with_limit<R: AsyncRead + Unpin>(
 
 /// Write pre-encoded PDU bytes to an async writer.
 pub async fn write_pdu<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> DcmResult<()> {
-    writer.write_all(data).await?;
-    Ok(())
-}
-
-/// Write one P-DATA-TF PDU containing a single PDV without copying its payload.
-///
-/// This is the bounded streaming primitive used for large C-STORE datasets.
-pub async fn write_pdata_fragment<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    context_id: u8,
-    message_control: u8,
-    data: &[u8],
-) -> DcmResult<()> {
-    let item_length = u32::try_from(data.len().saturating_add(2))
-        .map_err(|_| DcmError::Other("PDV payload exceeds the DICOM u32 length field".into()))?;
-    let body_length = item_length
-        .checked_add(4)
-        .ok_or_else(|| DcmError::Other("P-DATA-TF body length overflow".into()))?;
-
-    let mut header = [0u8; 12];
-    header[0] = PDU_P_DATA_TF;
-    header[2..6].copy_from_slice(&body_length.to_be_bytes());
-    header[6..10].copy_from_slice(&item_length.to_be_bytes());
-    header[10] = context_id;
-    header[11] = message_control;
-
-    writer.write_all(&header).await?;
     writer.write_all(data).await?;
     Ok(())
 }
@@ -824,15 +640,6 @@ mod tests {
             max_pdu_length: 65_536,
             implementation_class_uid: "1.3.6.1.4.1.30071.8.1".to_string(),
             implementation_version_name: "TEST_IMPL".to_string(),
-            asynchronous_operations_window: Some(AsynchronousOperationsWindow {
-                invoked: 4,
-                performed: 3,
-            }),
-            role_selections: vec![ScpScuRoleSelection {
-                sop_class_uid: "1.2.840.10008.1.1".to_string(),
-                scu_role: true,
-                scp_role: true,
-            }],
         }
     }
 
@@ -863,14 +670,6 @@ mod tests {
         assert_eq!(decoded.max_pdu_length, 65_536);
         assert_eq!(decoded.implementation_class_uid, "1.3.6.1.4.1.30071.8.1");
         assert_eq!(decoded.implementation_version_name, "TEST_IMPL");
-        assert_eq!(
-            decoded.asynchronous_operations_window,
-            Some(AsynchronousOperationsWindow {
-                invoked: 4,
-                performed: 3,
-            })
-        );
-        assert_eq!(decoded.role_selections, rq.role_selections);
     }
 
     #[test]
@@ -887,15 +686,6 @@ mod tests {
             max_pdu_length: 32_768,
             implementation_class_uid: "1.3.6.1.4.1.30071.8.1".to_string(),
             implementation_version_name: "SCP_IMPL".to_string(),
-            asynchronous_operations_window: Some(AsynchronousOperationsWindow {
-                invoked: 2,
-                performed: 1,
-            }),
-            role_selections: vec![ScpScuRoleSelection {
-                sop_class_uid: "1.2.840.10008.1.1".to_string(),
-                scu_role: true,
-                scp_role: false,
-            }],
         };
 
         let encoded = encode_associate_ac(&ac);
@@ -910,11 +700,6 @@ mod tests {
             "1.2.840.10008.1.2.1"
         );
         assert_eq!(decoded.max_pdu_length, 32_768);
-        assert_eq!(
-            decoded.asynchronous_operations_window,
-            ac.asynchronous_operations_window
-        );
-        assert_eq!(decoded.role_selections, ac.role_selections);
     }
 
     #[test]
@@ -1002,8 +787,6 @@ mod tests {
             max_pdu_length: 65_536,
             implementation_class_uid: "1.2.3".to_string(),
             implementation_version_name: String::new(),
-            asynchronous_operations_window: None,
-            role_selections: Vec::new(),
         };
         let encoded = encode_associate_rq(&rq);
         let decoded = decode_associate_rq(&encoded[6..]).unwrap();
@@ -1047,21 +830,5 @@ mod tests {
             }
             _ => panic!("expected PDataTf"),
         }
-    }
-
-    #[tokio::test]
-    async fn read_pdu_rejects_body_before_allocating_above_limit() {
-        let bytes = vec![PDU_P_DATA_TF, 0, 0, 0, 16, 0];
-        let mut cursor = std::io::Cursor::new(bytes);
-
-        let result = read_pdu_with_limit(&mut cursor, 1_024).await;
-
-        assert!(matches!(
-            result,
-            Err(DcmError::PduLengthExceeded {
-                length: 4_096,
-                maximum: 1_024,
-            })
-        ));
     }
 }

@@ -20,8 +20,6 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 bytes.workspace = true
-futures-core.workspace = true
-futures-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

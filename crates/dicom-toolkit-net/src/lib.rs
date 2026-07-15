@@ -6,7 +6,6 @@
 
 pub mod association;
 pub mod config;
-pub mod dataset_source;
 pub mod dimse;
 pub mod dul;
 pub mod pdu;
@@ -17,8 +16,6 @@ pub mod tls;
 
 pub use association::Association;
 pub use config::AssociationConfig;
-pub use dataset_source::{DatasetSource, FileDataset};
-pub use pdu::{AsynchronousOperationsWindow, ScpScuRoleSelection};
 pub use presentation::{PcResult, PresentationContextAc, PresentationContextRq};
 pub use server::{DicomServer, DicomServerBuilder, FileStoreProvider};
 pub use services::echo::c_echo;
@@ -27,11 +24,10 @@ pub use services::get::{
     c_get, handle_get_rq, GetRequest, GetResponse, GetResult, ReceivedInstance,
 };
 pub use services::provider::{
-    find_responses, DestinationLookup, FindEvent, FindResponseStream, FindServiceProvider,
-    GetEvent, GetServiceProvider, MoveEvent, MoveServiceProvider, RetrieveItem, RetrieveItemStream,
-    RetrievePlan, RetrievePresentationContext, StaticDestinationLookup, StoreEvent, StoreResult,
+    DestinationLookup, FindEvent, FindServiceProvider, GetEvent, GetServiceProvider, MoveEvent,
+    MoveServiceProvider, RetrieveItem, StaticDestinationLookup, StoreEvent, StoreResult,
     StoreServiceProvider, STATUS_PENDING, STATUS_PROCESSING_FAILURE, STATUS_SUCCESS,
-    STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS, STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
+    STATUS_WARNING,
 };
 pub use services::r#move::{c_move, handle_move_rq, MoveRequest, MoveResponse};
 pub use services::store::{c_store, handle_store_rq, StoreRequest, StoreResponse};

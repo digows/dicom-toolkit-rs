@@ -8,7 +8,7 @@ A pure-Rust port of [DCMTK](https://dicom.offis.de/dcmtk.php.en) 3.7.0 — a com
 
 This is an independent project, not affiliated with or endorsed by OFFIS e.V. See [NOTICE](NOTICE) for attribution details.
 
-[![Tests](https://img.shields.io/badge/tests-595%20passing-brightgreen)](#status)
+[![Tests](https://img.shields.io/badge/tests-488%20passing-brightgreen)](#status)
 
 ---
 
@@ -21,7 +21,7 @@ This is an independent project, not affiliated with or endorsed by OFFIS e.V. Se
 | 3 — Networking | `dicom-toolkit-net` | 59 |
 | 4 — Imaging & codecs | `dicom-toolkit-image`, `dicom-toolkit-codec`, `dicom-toolkit-jpeg2000` | 44 + 89 + 46 |
 | Tools | `dicom-toolkit-tools` | 10 integration |
-| **Total** | | **589 unit/integration + 6 doctests = 595 passing, 0 failed** |
+| **Total** | | **482 unit/integration + 6 doctests = 488 passing, 0 failed** |
 
 ---
 
@@ -156,37 +156,17 @@ let raw   = codec.decode(&compressed_bytes, width, height, samples)?;
 ### Async networking (C-ECHO)
 
 ```rust
-use dicom_toolkit_core::error::DcmResult;
-use dicom_toolkit_core::uid::sop_class;
-use dicom_toolkit_net::{
-    c_echo, Association, AssociationConfig, PresentationContextRq,
-};
+use dicom_toolkit_net::{association::Association, config::AssociationConfig};
 
 #[tokio::main]
-async fn main() -> DcmResult<()> {
+async fn main() -> anyhow::Result<()> {
     let cfg = AssociationConfig::default();
-    let contexts = [PresentationContextRq {
-        id: 1,
-        abstract_syntax: sop_class::VERIFICATION.to_string(),
-        transfer_syntaxes: vec!["1.2.840.10008.1.2.1".to_string()],
-    }];
-    let mut assoc = Association::request(
-        "pacs.example.com:11112",
-        "PACS",
-        "RUSTSCU",
-        &contexts,
-        &cfg,
-    )
-    .await?;
-    c_echo(&mut assoc, 1).await?;
+    let mut assoc = Association::request("pacs.example.com:11112", cfg).await?;
+    assoc.c_echo().await?;
     assoc.release().await?;
     Ok(())
 }
 ```
-
-For large file-backed C-STORE, lazy C-FIND/C-GET/C-MOVE providers, role
-selection, resource limits, and current concurrency boundaries, see
-[`docs/NETWORKING_STREAMING_FOUNDATION.md`](docs/NETWORKING_STREAMING_FOUNDATION.md).
 
 ---
 

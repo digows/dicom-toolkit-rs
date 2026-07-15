@@ -24,7 +24,6 @@ use dicom_toolkit_net::services::find::{c_find, FindRequest};
 use dicom_toolkit_net::services::get::{c_get, GetRequest};
 use dicom_toolkit_net::services::r#move::{c_move, MoveRequest};
 use dicom_toolkit_net::services::store::{c_store, StoreRequest};
-use dicom_toolkit_net::ScpScuRoleSelection;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -191,7 +190,7 @@ async fn test_store_loopback() {
         sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
         sop_instance_uid: "1.2.3.4.5.6".to_string(),
         priority: 0,
-        dataset: dataset_bytes.into(),
+        dataset_bytes,
         context_id: ctx_id,
     };
     let rsp = c_store(&mut assoc, req).await.unwrap();
@@ -338,9 +337,9 @@ async fn test_get_loopback() {
     tokio::spawn(async move {
         ready_clone.notify_one();
         let (stream, _) = listener.accept().await.unwrap();
-        let mut scp_config = open_scp_config("GETSCP");
-        scp_config.accept_requestor_scp_role = true;
-        let mut assoc = Association::accept(stream, &scp_config).await.unwrap();
+        let mut assoc = Association::accept(stream, &open_scp_config("GETSCP"))
+            .await
+            .unwrap();
 
         let (ctx_id, cmd) = assoc.recv_dimse_command().await.unwrap();
         assert_eq!(cmd.get_u16(tags::COMMAND_FIELD), Some(0x0010)); // C-GET-RQ
@@ -351,10 +350,6 @@ async fn test_get_loopback() {
             .trim_end_matches('\0')
             .to_string();
         let _query = assoc.recv_dimse_data().await.unwrap();
-        let storage_context_id = assoc
-            .find_context_for_scu_with_transfer_syntax(sop_class::CT_IMAGE_STORAGE, TS_EXPLICIT_LE)
-            .unwrap()
-            .id;
 
         let instances: &[(&str, &str, &[u8])] = &[
             (sop_class::CT_IMAGE_STORAGE, "1.2.3.101", &inst1_c),
@@ -386,14 +381,8 @@ async fn test_get_loopback() {
             store_rq.set_u16(tags::PRIORITY, 0);
             store_rq.set_u16(tags::COMMAND_DATA_SET_TYPE, 0x0000); // dataset follows
             store_rq.set_uid(tags::AFFECTED_SOP_INSTANCE_UID, si);
-            assoc
-                .send_dimse_command(storage_context_id, &store_rq)
-                .await
-                .unwrap();
-            assoc
-                .send_dimse_data(storage_context_id, data)
-                .await
-                .unwrap();
+            assoc.send_dimse_command(ctx_id, &store_rq).await.unwrap();
+            assoc.send_dimse_data(ctx_id, data).await.unwrap();
 
             // Wait for C-STORE-RSP from the SCU.
             let (_, store_rsp) = assoc.recv_dimse_command().await.unwrap();
@@ -418,14 +407,7 @@ async fn test_get_loopback() {
 
     // ── SCU ───────────────────────────────────────────────────────────────────
     ready.notified().await;
-    let scu_cfg = AssociationConfig {
-        requested_role_selections: vec![ScpScuRoleSelection {
-            sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
-            scu_role: false,
-            scp_role: true,
-        }],
-        ..Default::default()
-    };
+    let scu_cfg = AssociationConfig::default();
     let mut assoc = Association::request(
         &format!("127.0.0.1:{port}"),
         "GETSCP",
@@ -604,7 +586,7 @@ async fn test_move_loopback() {
                 sop_class_uid: sc.to_string(),
                 sop_instance_uid: si.to_string(),
                 priority: 0,
-                dataset: data.to_vec().into(),
+                dataset_bytes: data.to_vec(),
                 context_id: store_ctx,
             };
             let store_rsp = c_store(&mut sub, req).await.unwrap();

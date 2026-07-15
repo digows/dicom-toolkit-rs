@@ -193,7 +193,7 @@ async fn main() {
             sop_class_uid: sop_class.clone(),
             sop_instance_uid: sop_instance.clone(),
             priority: 0,
-            dataset: dataset_bytes.into(),
+            dataset_bytes,
             context_id: ctx_id,
         };
 
