@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{DataSet, FileFormat};
@@ -415,6 +415,40 @@ async fn handle_connection(
     } else {
         Association::accept(stream, config).await?
     };
+
+    info!(
+        peer_addr = %assoc.peer_addr,
+        calling_ae = %assoc.calling_ae.trim(),
+        called_ae = %assoc.called_ae.trim(),
+        accepted_presentation_context_count = assoc.presentation_contexts.len(),
+        negotiated_role_selection_count = assoc.role_selections.len(),
+        maximum_peer_pdu_length = assoc.max_pdu_length,
+        "association negotiation completed"
+    );
+    for context in &assoc.presentation_contexts {
+        debug!(
+            peer_addr = %assoc.peer_addr,
+            calling_ae = %assoc.calling_ae.trim(),
+            called_ae = %assoc.called_ae.trim(),
+            presentation_context_id = context.id,
+            abstract_syntax_uid = %context.abstract_syntax,
+            transfer_syntax_uid = %context.transfer_syntax,
+            local_scu_role = assoc.local_scu_role(&context.abstract_syntax),
+            local_scp_role = assoc.local_scp_role(&context.abstract_syntax),
+            "presentation context accepted"
+        );
+    }
+    for role in &assoc.role_selections {
+        debug!(
+            peer_addr = %assoc.peer_addr,
+            calling_ae = %assoc.calling_ae.trim(),
+            called_ae = %assoc.called_ae.trim(),
+            sop_class_uid = %role.sop_class_uid,
+            requestor_scu_role = role.scu_role,
+            requestor_scp_role = role.scp_role,
+            "SCP/SCU role selection negotiated"
+        );
+    }
 
     loop {
         let (ctx_id, cmd) = match assoc.recv_dimse_command().await {

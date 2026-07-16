@@ -132,6 +132,38 @@ fn successful_store_response(store_request: &DataSet) -> DataSet {
     response
 }
 
+async fn receive_initial_pending_response(
+    association: &mut Association,
+    expected_command_field: u16,
+    expected_remaining_suboperations: u16,
+) {
+    let (_, response) = association
+        .recv_dimse_command()
+        .await
+        .expect("receive initial retrieve pending response");
+    assert_eq!(
+        response.get_u16(tags::COMMAND_FIELD),
+        Some(expected_command_field)
+    );
+    assert_eq!(response.get_u16(tags::STATUS), Some(0xFF00));
+    assert_eq!(
+        response.get_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS),
+        Some(expected_remaining_suboperations)
+    );
+    assert_eq!(
+        response.get_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS),
+        Some(0)
+    );
+    assert_eq!(
+        response.get_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS),
+        Some(0)
+    );
+    assert_eq!(
+        response.get_u16(tags::NUMBER_OF_WARNING_SUB_OPERATIONS),
+        Some(0)
+    );
+}
+
 fn move_request_command(message_id: u16, destination: &str) -> DataSet {
     let mut command = DataSet::new();
     command.set_uid(
@@ -343,6 +375,7 @@ async fn matching_cancel_drops_a_pending_provider_stream_and_ignores_a_mismatch(
         .send_dimse_data(query_context_id, &query_identifier())
         .await
         .expect("send identifier");
+    receive_initial_pending_response(&mut association, 0x8010, 3).await;
     association
         .send_dimse_command(query_context_id, &cancel_command(retrieve_message_id + 1))
         .await
@@ -443,6 +476,7 @@ async fn matching_move_cancel_drops_a_pending_provider_stream() {
         .send_dimse_data(query_context_id, &query_identifier())
         .await
         .expect("send identifier");
+    receive_initial_pending_response(&mut association, 0x8021, 3).await;
     association
         .send_dimse_command(query_context_id, &cancel_command(retrieve_message_id))
         .await
@@ -587,6 +621,7 @@ async fn cancel_during_active_move_store_aborts_the_storage_association_and_pres
         .send_dimse_data(query_context_id, &query_identifier())
         .await
         .expect("send identifier");
+    receive_initial_pending_response(&mut association, 0x8021, 2).await;
 
     timeout(Duration::from_secs(5), store_request_received_receiver)
         .await
@@ -704,6 +739,7 @@ async fn cancel_during_c_get_finishes_the_current_store_before_returning_cancel(
         .send_dimse_data(query_context_id, &query_identifier())
         .await
         .expect("send identifier");
+    receive_initial_pending_response(&mut association, 0x8010, 2).await;
 
     let (store_context_id, store_request) = association
         .recv_dimse_command()
@@ -798,6 +834,7 @@ async fn cancel_while_waiting_for_store_response_still_accounts_that_response() 
         .send_dimse_data(query_context_id, &query_identifier())
         .await
         .expect("send identifier");
+    receive_initial_pending_response(&mut association, 0x8010, 1).await;
 
     let (store_context_id, store_request) = association
         .recv_dimse_command()

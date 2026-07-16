@@ -4,7 +4,7 @@ use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, io::writer::DicomWriter, DataSet};
 use dicom_toolkit_dict::{tags, Tag, Vr};
 use futures_util::{stream, StreamExt};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::association::Association;
 use crate::services::provider::{
@@ -369,6 +369,32 @@ async fn execute_get_plan(
     let mut cancelled = false;
     let mut failed_sop_instance_uids = Vec::new();
 
+    info!(
+        dimse_service = "C-GET",
+        calling_ae = %assoc.calling_ae.trim(),
+        called_ae = %assoc.called_ae.trim(),
+        information_model = %sop_class,
+        total_suboperations = total,
+        enforce_negotiated_role,
+        "C-GET retrieval plan execution started"
+    );
+
+    if total > 0 {
+        send_pending_response(
+            assoc,
+            sop_class,
+            ctx_id,
+            msg_id,
+            SubOperationCounts {
+                remaining: total,
+                completed,
+                failed,
+                warning,
+            },
+        )
+        .await?;
+    }
+
     loop {
         let result = match next_get_outcome_or_cancel(assoc, &mut items, msg_id).await? {
             NextGetOutcome::Item(Some(result)) => result,
@@ -436,6 +462,19 @@ async fn execute_get_plan(
         if let Some(store_ctx_id) = store_ctx {
             let sub_msg_id = next_message_id();
 
+            debug!(
+                dimse_service = "C-STORE",
+                parent_dimse_service = "C-GET",
+                calling_ae = %assoc.calling_ae.trim(),
+                called_ae = %assoc.called_ae.trim(),
+                presentation_context_id = store_ctx_id,
+                sop_class_uid = %item.sop_class_uid,
+                sop_instance_uid = %item.sop_instance_uid,
+                transfer_syntax_uid = %item.transfer_syntax_uid,
+                message_id = sub_msg_id,
+                "sending C-STORE sub-operation"
+            );
+
             let mut store_rq = DataSet::new();
             store_rq.set_uid(tags::AFFECTED_SOP_CLASS_UID, &item.sop_class_uid);
             store_rq.set_u16(tags::COMMAND_FIELD, 0x0001); // C-STORE-RQ
@@ -485,16 +524,79 @@ async fn execute_get_plan(
                 && response_command == 0x8001
             {
                 completed += 1;
+                debug!(
+                    dimse_service = "C-STORE",
+                    parent_dimse_service = "C-GET",
+                    sop_instance_uid = %item.sop_instance_uid,
+                    status = format_args!("0x{store_status:04X}"),
+                    "C-STORE sub-operation completed"
+                );
             } else if is_warning_status(store_status)
                 && response_message_id == sub_msg_id
                 && response_command == 0x8001
             {
                 warning += 1;
+                warn!(
+                    dimse_service = "C-STORE",
+                    parent_dimse_service = "C-GET",
+                    sop_instance_uid = %item.sop_instance_uid,
+                    status = format_args!("0x{store_status:04X}"),
+                    response_command = format_args!("0x{response_command:04X}"),
+                    response_message_id,
+                    expected_message_id = sub_msg_id,
+                    "C-STORE sub-operation completed with warning"
+                );
             } else {
                 failed += 1;
                 failed_sop_instance_uids.push(item.sop_instance_uid.clone());
+                warn!(
+                    dimse_service = "C-STORE",
+                    parent_dimse_service = "C-GET",
+                    sop_class_uid = %item.sop_class_uid,
+                    sop_instance_uid = %item.sop_instance_uid,
+                    transfer_syntax_uid = %item.transfer_syntax_uid,
+                    status = format_args!("0x{store_status:04X}"),
+                    response_command = format_args!("0x{response_command:04X}"),
+                    response_message_id,
+                    expected_message_id = sub_msg_id,
+                    "C-STORE sub-operation failed"
+                );
             }
         } else {
+            let local_scu_role = assoc.local_scu_role(&item.sop_class_uid);
+            let accepted_transfer_syntax_uids = assoc
+                .presentation_contexts
+                .iter()
+                .filter(|context| {
+                    context.result.is_accepted() && context.abstract_syntax == item.sop_class_uid
+                })
+                .map(|context| context.transfer_syntax.as_str())
+                .collect::<Vec<_>>();
+            let requestor_role_selection = assoc
+                .role_selections
+                .iter()
+                .find(|role| role.sop_class_uid == item.sop_class_uid);
+            let reason = if !local_scu_role {
+                "local Storage SCU role was not negotiated"
+            } else if accepted_transfer_syntax_uids.is_empty() {
+                "no Storage presentation context was accepted for the SOP Class"
+            } else {
+                "the source Transfer Syntax was not accepted for the SOP Class"
+            };
+            warn!(
+                dimse_service = "C-GET",
+                calling_ae = %assoc.calling_ae.trim(),
+                called_ae = %assoc.called_ae.trim(),
+                sop_class_uid = %item.sop_class_uid,
+                sop_instance_uid = %item.sop_instance_uid,
+                source_transfer_syntax_uid = %item.transfer_syntax_uid,
+                local_scu_role,
+                requestor_scu_role = requestor_role_selection.map(|role| role.scu_role),
+                requestor_scp_role = requestor_role_selection.map(|role| role.scp_role),
+                ?accepted_transfer_syntax_uids,
+                reason,
+                "C-GET instance has no compatible negotiated C-STORE presentation context"
+            );
             failed += 1;
             failed_sop_instance_uids.push(item.sop_instance_uid.clone());
         }
@@ -543,6 +645,21 @@ async fn execute_get_plan(
     } else {
         STATUS_SUCCESS
     };
+
+    info!(
+        dimse_service = "C-GET",
+        calling_ae = %assoc.calling_ae.trim(),
+        called_ae = %assoc.called_ae.trim(),
+        information_model = %sop_class,
+        total_suboperations = total,
+        completed_suboperations = completed,
+        failed_suboperations = failed,
+        warning_suboperations = warning,
+        cancelled,
+        provider_failed,
+        final_status = format_args!("0x{final_status:04X}"),
+        "C-GET retrieval plan execution completed"
+    );
 
     send_final_response_with_failures(
         assoc,

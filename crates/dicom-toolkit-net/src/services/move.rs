@@ -4,7 +4,7 @@ use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, io::writer::DicomWriter, DataSet};
 use dicom_toolkit_dict::{tags, Tag, Vr};
 use futures_util::StreamExt;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::association::Association;
 use crate::config::AssociationConfig;
@@ -406,6 +406,32 @@ where
         .await;
     }
 
+    info!(
+        dimse_service = "C-MOVE",
+        calling_ae = %assoc.calling_ae.trim(),
+        called_ae = %assoc.called_ae.trim(),
+        destination_ae = %destination,
+        destination_address = %dest_addr,
+        information_model = %sop_class,
+        total_suboperations = total,
+        proposed_storage_presentation_context_count = storage_contexts.len(),
+        "C-MOVE retrieval plan execution started"
+    );
+
+    send_pending_response(
+        assoc,
+        &sop_class,
+        ctx_id,
+        msg_id,
+        SubOperationCounts {
+            remaining: total,
+            completed: 0,
+            failed: 0,
+            warning: 0,
+        },
+    )
+    .await?;
+
     let declared_contexts = storage_contexts
         .iter()
         .map(|context| {
@@ -458,6 +484,26 @@ where
             .await;
         }
     };
+
+    info!(
+        dimse_service = "C-MOVE",
+        destination_ae = %destination,
+        destination_address = %dest_addr,
+        accepted_storage_presentation_context_count = sub_assoc.presentation_contexts.len(),
+        negotiated_role_selection_count = sub_assoc.role_selections.len(),
+        "C-MOVE destination association negotiation completed"
+    );
+    for context in &sub_assoc.presentation_contexts {
+        debug!(
+            dimse_service = "C-MOVE",
+            destination_ae = %destination,
+            presentation_context_id = context.id,
+            sop_class_uid = %context.abstract_syntax,
+            transfer_syntax_uid = %context.transfer_syntax,
+            local_scu_role = sub_assoc.local_scu_role(&context.abstract_syntax),
+            "C-MOVE destination presentation context accepted"
+        );
+    }
 
     let mut completed: u16 = 0;
     let mut failed: u16 = 0;
@@ -534,6 +580,16 @@ where
             .flatten()
         {
             let failed_sop_instance_uid = item.sop_instance_uid.clone();
+            debug!(
+                dimse_service = "C-STORE",
+                parent_dimse_service = "C-MOVE",
+                destination_ae = %destination,
+                presentation_context_id = store_context_id,
+                sop_class_uid = %item.sop_class_uid,
+                sop_instance_uid = %item.sop_instance_uid,
+                transfer_syntax_uid = %item.transfer_syntax_uid,
+                "sending C-STORE sub-operation"
+            );
             let req = StoreSourceRequest {
                 sop_class_uid: item.sop_class_uid,
                 sop_instance_uid: item.sop_instance_uid,
@@ -543,12 +599,42 @@ where
             };
             match move_store_or_cancel(assoc, &mut sub_assoc, req, msg_id).await? {
                 MoveStoreOutcome::Response(Ok(response)) if response.status == STATUS_SUCCESS => {
-                    completed += 1
+                    completed += 1;
+                    debug!(
+                        dimse_service = "C-STORE",
+                        parent_dimse_service = "C-MOVE",
+                        sop_instance_uid = %failed_sop_instance_uid,
+                        status = format_args!("0x{:04X}", response.status),
+                        "C-STORE sub-operation completed"
+                    );
                 }
                 MoveStoreOutcome::Response(Ok(response)) if is_warning_status(response.status) => {
-                    warning += 1
+                    warning += 1;
+                    warn!(
+                        dimse_service = "C-STORE",
+                        parent_dimse_service = "C-MOVE",
+                        sop_instance_uid = %failed_sop_instance_uid,
+                        status = format_args!("0x{:04X}", response.status),
+                        "C-STORE sub-operation completed with warning"
+                    );
                 }
-                MoveStoreOutcome::Response(_) => {
+                MoveStoreOutcome::Response(response) => {
+                    match &response {
+                        Ok(response) => warn!(
+                            dimse_service = "C-STORE",
+                            parent_dimse_service = "C-MOVE",
+                            sop_instance_uid = %failed_sop_instance_uid,
+                            status = format_args!("0x{:04X}", response.status),
+                            "C-STORE sub-operation failed"
+                        ),
+                        Err(error) => warn!(
+                            dimse_service = "C-STORE",
+                            parent_dimse_service = "C-MOVE",
+                            sop_instance_uid = %failed_sop_instance_uid,
+                            %error,
+                            "C-STORE sub-operation failed"
+                        ),
+                    }
                     failed += 1;
                     failed_sop_instance_uids.push(failed_sop_instance_uid);
                 }
@@ -571,6 +657,38 @@ where
                 }
             }
         } else {
+            let was_declared = declared_contexts.contains(&context_key);
+            let local_scu_role = sub_assoc.local_scu_role(&item.sop_class_uid);
+            let accepted_transfer_syntax_uids = sub_assoc
+                .presentation_contexts
+                .iter()
+                .filter(|context| {
+                    context.result.is_accepted() && context.abstract_syntax == item.sop_class_uid
+                })
+                .map(|context| context.transfer_syntax.as_str())
+                .collect::<Vec<_>>();
+            let reason = if !was_declared {
+                "the retrieve plan did not declare the source SOP Class and Transfer Syntax pair"
+            } else if !local_scu_role {
+                "local Storage SCU role was not negotiated"
+            } else if accepted_transfer_syntax_uids.is_empty() {
+                "the destination accepted no Storage presentation context for the SOP Class"
+            } else {
+                "the destination did not accept the source Transfer Syntax for the SOP Class"
+            };
+            warn!(
+                dimse_service = "C-MOVE",
+                destination_ae = %destination,
+                destination_address = %dest_addr,
+                sop_class_uid = %item.sop_class_uid,
+                sop_instance_uid = %item.sop_instance_uid,
+                source_transfer_syntax_uid = %item.transfer_syntax_uid,
+                was_declared,
+                local_scu_role,
+                ?accepted_transfer_syntax_uids,
+                reason,
+                "C-MOVE instance has no compatible negotiated C-STORE presentation context"
+            );
             failed += 1;
             failed_sop_instance_uids.push(item.sop_instance_uid);
         }
@@ -619,6 +737,23 @@ where
     } else {
         STATUS_SUCCESS
     };
+
+    info!(
+        dimse_service = "C-MOVE",
+        calling_ae = %assoc.calling_ae.trim(),
+        called_ae = %assoc.called_ae.trim(),
+        destination_ae = %destination,
+        destination_address = %dest_addr,
+        information_model = %sop_class,
+        total_suboperations = total,
+        completed_suboperations = completed,
+        failed_suboperations = failed,
+        warning_suboperations = warning,
+        cancelled,
+        provider_failed,
+        final_status = format_args!("0x{final_status:04X}"),
+        "C-MOVE retrieval plan execution completed"
+    );
 
     send_final_response_with_failures(
         assoc,
