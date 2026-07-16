@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_core::uid::sop_class;
@@ -15,6 +16,9 @@ use dicom_toolkit_net::{
     StreamingRetrieveItem, StreamingRetrieveItemStream, STATUS_CANCEL, STATUS_WARNING,
 };
 use futures_util::stream;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 const TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2.1";
 const TRANSFER_SYNTAX_IMPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2";
@@ -166,6 +170,16 @@ struct PendingStreamingGetProvider {
 
 struct PendingStreamingMoveProvider {
     stream_dropped: Arc<AtomicBool>,
+}
+
+struct FixedStreamingMoveProvider {
+    items: Vec<StreamingRetrieveItem>,
+}
+
+impl StreamingMoveServiceProvider for FixedStreamingMoveProvider {
+    async fn on_move_stream(&self, _event: MoveEvent) -> DcmResult<MoveRetrievePlan> {
+        MoveRetrievePlan::from_items(self.items.clone())
+    }
 }
 
 impl StreamingMoveServiceProvider for PendingStreamingMoveProvider {
@@ -463,6 +477,172 @@ async fn matching_move_cancel_drops_a_pending_provider_stream() {
         .await
         .expect("destination server task")
         .expect("destination server run");
+}
+
+#[tokio::test]
+async fn cancel_during_active_move_store_aborts_the_storage_association_and_preserves_the_request_association(
+) {
+    const DATASET_LENGTH: u64 = 64 * 1024 * 1024;
+    let temporary_file = tempfile::NamedTempFile::new().expect("create temporary file");
+    temporary_file
+        .as_file()
+        .set_len(DATASET_LENGTH)
+        .expect("create sparse dataset");
+
+    let destination_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind destination listener");
+    let destination_address = destination_listener
+        .local_addr()
+        .expect("destination listener address");
+    let (store_request_received_sender, store_request_received_receiver) = oneshot::channel();
+    let (allow_dataset_read_sender, allow_dataset_read_receiver) = oneshot::channel();
+    let destination_task = tokio::spawn(async move {
+        let (stream, _) = destination_listener
+            .accept()
+            .await
+            .expect("accept destination association");
+        let mut association = Association::accept(stream, &AssociationConfig::default())
+            .await
+            .expect("accept destination association protocol");
+        let (_, store_request) = association
+            .recv_dimse_command()
+            .await
+            .expect("receive active C-STORE-RQ");
+        assert_eq!(store_request.get_u16(tags::COMMAND_FIELD), Some(0x0001));
+        store_request_received_sender
+            .send(())
+            .expect("signal active C-STORE-RQ");
+
+        allow_dataset_read_receiver
+            .await
+            .expect("allow destination dataset read");
+        let error = association
+            .recv_dimse_data()
+            .await
+            .expect_err("C-MOVE cancellation must abort the Storage association");
+        assert!(matches!(
+            error,
+            dicom_toolkit_core::error::DcmError::AssociationAborted { .. }
+        ));
+    });
+
+    let first_sop_instance_uid = "1.2.826.0.1.7";
+    let query_retrieve_server = DicomServer::builder()
+        .ae_title("MOVESCP")
+        .port(0)
+        .streaming_move_provider(FixedStreamingMoveProvider {
+            items: vec![
+                StreamingRetrieveItem {
+                    sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+                    sop_instance_uid: first_sop_instance_uid.to_string(),
+                    transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                    dataset: DatasetSource::file_region(temporary_file.path(), 0, DATASET_LENGTH),
+                },
+                StreamingRetrieveItem {
+                    sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+                    sop_instance_uid: "1.2.826.0.1.8".to_string(),
+                    transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                    dataset: DatasetSource::bytes(encoded_instance("1.2.826.0.1.8")),
+                },
+            ],
+        })
+        .move_destination_lookup(StaticDestinationLookup::new(vec![(
+            "DESTINATION".to_string(),
+            destination_address.to_string(),
+        )]))
+        .build()
+        .await
+        .expect("build query/retrieve server");
+    let query_retrieve_address = loopback_address(
+        query_retrieve_server
+            .local_addr()
+            .expect("query/retrieve address"),
+    );
+    let query_retrieve_cancellation_token = query_retrieve_server.cancellation_token();
+    let query_retrieve_server_task = tokio::spawn(async move { query_retrieve_server.run().await });
+
+    let mut association = Association::request(
+        &query_retrieve_address.to_string(),
+        "MOVESCP",
+        "MOVESCU",
+        &[query_retrieve_move_context(1)],
+        &AssociationConfig::default(),
+    )
+    .await
+    .expect("associate");
+    let query_context_id = association
+        .find_context(sop_class::PATIENT_ROOT_QR_MOVE)
+        .expect("query context")
+        .id;
+    let retrieve_message_id = 45;
+    association
+        .send_dimse_command(
+            query_context_id,
+            &move_request_command(retrieve_message_id, "DESTINATION"),
+        )
+        .await
+        .expect("send C-MOVE-RQ");
+    association
+        .send_dimse_data(query_context_id, &query_identifier())
+        .await
+        .expect("send identifier");
+
+    timeout(Duration::from_secs(5), store_request_received_receiver)
+        .await
+        .expect("C-STORE-RQ must become active before cancellation")
+        .expect("destination must observe active C-STORE-RQ");
+    association
+        .send_dimse_command(query_context_id, &cancel_command(retrieve_message_id))
+        .await
+        .expect("send C-CANCEL-MOVE-RQ during active C-STORE");
+    allow_dataset_read_sender
+        .send(())
+        .expect("allow destination to observe the abort");
+
+    let (_, final_response) = timeout(Duration::from_secs(5), association.recv_dimse_command())
+        .await
+        .expect("receive final C-MOVE-RSP before timeout")
+        .expect("receive final C-MOVE-RSP");
+    assert_eq!(final_response.get_u16(tags::COMMAND_FIELD), Some(0x8021));
+    assert_eq!(final_response.get_u16(tags::STATUS), Some(STATUS_CANCEL));
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_REMAINING_SUB_OPERATIONS),
+        Some(1)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS),
+        Some(0)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS),
+        Some(1)
+    );
+    let failed_identifier = association
+        .recv_dimse_data()
+        .await
+        .expect("receive failed SOP Instance UID List");
+    let failed_identifier = DicomReader::new(failed_identifier.as_slice())
+        .read_dataset(TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN)
+        .expect("decode failed SOP Instance UID List");
+    assert_eq!(
+        failed_identifier.get_string(Tag::new(0x0008, 0x0058)),
+        Some(first_sop_instance_uid)
+    );
+
+    association
+        .release()
+        .await
+        .expect("the C-MOVE request association remains usable after cancellation");
+    timeout(Duration::from_secs(5), destination_task)
+        .await
+        .expect("destination task completes before timeout")
+        .expect("destination task");
+    query_retrieve_cancellation_token.cancel();
+    query_retrieve_server_task
+        .await
+        .expect("query/retrieve server task")
+        .expect("query/retrieve server run");
 }
 
 #[tokio::test]

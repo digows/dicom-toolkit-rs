@@ -19,8 +19,9 @@ pub use dataset::{parse_attribute_path, resolve_attribute_path, AttributePathSeg
 pub use element::Element;
 pub use file_format::FileFormat;
 pub use io::{
-    element_value_bytes, read_part10_file_index, read_part10_file_layout, DicomReader, DicomWriter,
-    Part10FileIdentity, Part10FileIndex, Part10FileLayout, Part10ReadLimits,
+    element_value_bytes, part10_inspection_limit_from_error, read_part10_file_index,
+    read_part10_file_layout, DicomReader, DicomWriter, Part10FileIdentity, Part10FileIndex,
+    Part10FileLayout, Part10InspectionLimit, Part10ReadLimits,
 };
 pub use meta_info::FileMetaInformation;
 pub use value::{

@@ -157,7 +157,9 @@ absent when there are no failed SOP Instance UIDs.
 For C-GET, an already-started C-STORE-RQ is completed in full and its matching
 C-STORE-RSP is received and accounted before the final C-GET cancel response.
 This avoids marking a truncated dataset as the last fragment solely because
-C-CANCEL-GET was received.
+C-CANCEL-GET was received. Consequently, cancel latency can include the
+remaining bytes and storage response for the current object; an application
+should report a pending cancellation rather than promise an immediate stop.
 
 For C-MOVE, the Storage transfer is on a different association. Cancellation
 keeps the active write future alive through the current complete P-DATA-TF PDU
@@ -221,7 +223,9 @@ The automated suite covers:
 - provider stream drop on C-GET and C-MOVE cancellation;
 - C-GET cancellation during a 32 MiB file stream, including the complete
   C-STORE response boundary;
-- C-MOVE Storage cancellation at a complete PDU boundary followed by A-ABORT;
+- C-MOVE cancellation during an active C-STORE on a separate Storage
+  association, including A-ABORT at a complete PDU boundary, FE00 counters,
+  Failed SOP Instance UID List, and a clean release of the request association;
 - bounded Part 10 inspection for explicit, implicit, big-endian, and deflated
   datasets, including a sparse 900 MiB file;
 - concurrent loopback associations and configurable shutdown deadlines.

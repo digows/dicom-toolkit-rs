@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0-rc.3"
+version = "0.6.0-rc.4"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -23,15 +23,15 @@ categories = ["science", "parser-implementations", "encoding"]
 
 [workspace.dependencies]
 # Internal crates
-dicom-toolkit-core = { path = "crates/dicom-toolkit-core", version = "0.6.0-rc.3" }
-dicom-toolkit-dict = { path = "crates/dicom-toolkit-dict", version = "0.6.0-rc.3" }
-dicom-toolkit-data = { path = "crates/dicom-toolkit-data", version = "0.6.0-rc.3" }
-dicom-toolkit-net = { path = "crates/dicom-toolkit-net", version = "0.6.0-rc.3" }
-dicom-toolkit-image = { path = "crates/dicom-toolkit-image", version = "0.6.0-rc.3" }
-dicom-toolkit-codec = { path = "crates/dicom-toolkit-codec", version = "0.6.0-rc.3" }
+dicom-toolkit-core = { path = "crates/dicom-toolkit-core", version = "0.6.0-rc.4" }
+dicom-toolkit-dict = { path = "crates/dicom-toolkit-dict", version = "0.6.0-rc.4" }
+dicom-toolkit-data = { path = "crates/dicom-toolkit-data", version = "0.6.0-rc.4" }
+dicom-toolkit-net = { path = "crates/dicom-toolkit-net", version = "0.6.0-rc.4" }
+dicom-toolkit-image = { path = "crates/dicom-toolkit-image", version = "0.6.0-rc.4" }
+dicom-toolkit-codec = { path = "crates/dicom-toolkit-codec", version = "0.6.0-rc.4" }
 
 # JPEG 2000 (published fork for DICOM-native decode/encode support)
-dicom-toolkit-jpeg2000 = { path = "crates/dicom-toolkit-jpeg2000", version = "0.6.0-rc.3", default-features = false, features = ["std", "simd", "openjph-htj2k"] }
+dicom-toolkit-jpeg2000 = { path = "crates/dicom-toolkit-jpeg2000", version = "0.6.0-rc.4", default-features = false, features = ["std", "simd", "openjph-htj2k"] }
 
 # Error handling
 thiserror = "2"

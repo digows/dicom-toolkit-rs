@@ -15,6 +15,57 @@ use crate::meta_info::FileMetaInformation;
 
 const PART10_PREAMBLE_AND_PREFIX_LENGTH: u64 = 132;
 const FILE_META_GROUP_LENGTH_ELEMENT_LENGTH: u64 = 12;
+const INSPECTION_LIMIT_ERROR_PREFIX: &str = "Part 10 inspection limit exceeded: ";
+
+/// A resource ceiling applied while inspecting a Part 10 file.
+///
+/// These limits are policy controls, not statements about whether a DICOM file
+/// is syntactically valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part10InspectionLimit {
+    FileMetaBytes,
+    DatasetPrefixBytes,
+    SequenceDepth,
+    UidValueBytes,
+}
+
+impl Part10InspectionLimit {
+    const fn marker(self) -> &'static str {
+        match self {
+            Self::FileMetaBytes => "file-meta-bytes",
+            Self::DatasetPrefixBytes => "dataset-prefix-bytes",
+            Self::SequenceDepth => "sequence-depth",
+            Self::UidValueBytes => "uid-value-bytes",
+        }
+    }
+
+    fn from_marker(marker: &str) -> Option<Self> {
+        match marker {
+            "file-meta-bytes" => Some(Self::FileMetaBytes),
+            "dataset-prefix-bytes" => Some(Self::DatasetPrefixBytes),
+            "sequence-depth" => Some(Self::SequenceDepth),
+            "uid-value-bytes" => Some(Self::UidValueBytes),
+            _ => None,
+        }
+    }
+}
+
+/// Return the policy limit exceeded by a bounded Part 10 inspection error.
+///
+/// A `None` result means that the error represents malformed input, an
+/// unsupported operation, or another non-limit failure. Existing inspection
+/// APIs retain their `DcmResult` return type; this additive helper lets callers
+/// distinguish a valid-but-too-expensive object from invalid Part 10 input.
+pub fn part10_inspection_limit_from_error(error: &DcmError) -> Option<Part10InspectionLimit> {
+    let DcmError::InvalidFile { reason } = error else {
+        return None;
+    };
+    let marker = reason
+        .strip_prefix(INSPECTION_LIMIT_ERROR_PREFIX)?
+        .split_once(' ')?
+        .0;
+    Part10InspectionLimit::from_marker(marker)
+}
 
 /// Resource limits for bounded Part 10 inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +154,9 @@ pub fn read_part10_file_layout<R: Read + Seek>(
         return invalid_file("File Meta Information Group Length must not be zero");
     }
     if file_meta_length > limits.maximum_file_meta_bytes {
-        return invalid_file(format!(
-            "File Meta Information length {file_meta_length} exceeds configured maximum {}",
-            limits.maximum_file_meta_bytes
+        return Err(inspection_limit_error(
+            Part10InspectionLimit::FileMetaBytes,
+            limits.maximum_file_meta_bytes,
         ));
     }
 
@@ -241,6 +292,15 @@ fn invalid_file<T>(reason: impl Into<String>) -> DcmResult<T> {
     })
 }
 
+fn inspection_limit_error(limit: Part10InspectionLimit, maximum: u64) -> DcmError {
+    DcmError::InvalidFile {
+        reason: format!(
+            "{INSPECTION_LIMIT_ERROR_PREFIX}{} maximum {maximum}",
+            limit.marker()
+        ),
+    }
+}
+
 struct PrefixReader<R> {
     inner: R,
     consumed: u64,
@@ -265,9 +325,9 @@ impl<R: Read> PrefixReader<R> {
                 reason: "dataset prefix byte count overflow".into(),
             })?;
         if next > self.limit {
-            return invalid_file(format!(
-                "required dataset identity exceeds configured prefix maximum {}",
-                self.limit
+            return Err(inspection_limit_error(
+                Part10InspectionLimit::DatasetPrefixBytes,
+                self.limit,
             ));
         }
         self.inner.read_exact(buffer)?;
@@ -387,9 +447,13 @@ fn read_uid_value<R: Read>(
     }
     let length = header.length as usize;
     if length == 0 || length > maximum_uid_value_bytes {
-        return invalid_file(format!(
-            "identity UID length {length} exceeds configured maximum {maximum_uid_value_bytes} or is empty"
-        ));
+        if length > maximum_uid_value_bytes {
+            return Err(inspection_limit_error(
+                Part10InspectionLimit::UidValueBytes,
+                maximum_uid_value_bytes as u64,
+            ));
+        }
+        return invalid_file("identity UID must not be empty");
     }
     let mut encoded = vec![0_u8; length];
     reader.read_exact(&mut encoded)?;
@@ -525,8 +589,9 @@ fn skip_undefined_item<R: Read>(
 
 fn require_depth(depth: usize, maximum_depth: usize) -> DcmResult<()> {
     if depth > maximum_depth {
-        return invalid_file(format!(
-            "undefined-length sequence nesting exceeds configured maximum {maximum_depth}"
+        return Err(inspection_limit_error(
+            Part10InspectionLimit::SequenceDepth,
+            maximum_depth as u64,
         ));
     }
     Ok(())
@@ -710,17 +775,41 @@ mod tests {
             maximum_file_meta_bytes: 1,
             ..Part10ReadLimits::default()
         };
-        assert!(
-            read_part10_file_layout(&mut std::io::Cursor::new(&encoded), meta_limited).is_err()
+        let meta_error = read_part10_file_layout(&mut std::io::Cursor::new(&encoded), meta_limited)
+            .expect_err("the File Meta Information must exceed the configured limit");
+        assert_eq!(
+            part10_inspection_limit_from_error(&meta_error),
+            Some(Part10InspectionLimit::FileMetaBytes)
         );
 
         let prefix_limited = Part10ReadLimits {
             maximum_dataset_prefix_bytes: 8,
             ..Part10ReadLimits::default()
         };
-        assert!(
-            read_part10_file_index(&mut std::io::Cursor::new(encoded), prefix_limited).is_err()
+        let prefix_error =
+            read_part10_file_index(&mut std::io::Cursor::new(encoded), prefix_limited)
+                .expect_err("the identity must exceed the configured prefix limit");
+        assert_eq!(
+            part10_inspection_limit_from_error(&prefix_error),
+            Some(Part10InspectionLimit::DatasetPrefixBytes)
         );
+    }
+
+    #[test]
+    fn classifies_only_bounded_inspection_limits() {
+        for limit in [
+            Part10InspectionLimit::FileMetaBytes,
+            Part10InspectionLimit::DatasetPrefixBytes,
+            Part10InspectionLimit::SequenceDepth,
+            Part10InspectionLimit::UidValueBytes,
+        ] {
+            let error = inspection_limit_error(limit, 1);
+            assert_eq!(part10_inspection_limit_from_error(&error), Some(limit));
+        }
+        let malformed_error = DcmError::InvalidFile {
+            reason: "missing DICM prefix at byte offset 128".to_string(),
+        };
+        assert_eq!(part10_inspection_limit_from_error(&malformed_error), None);
     }
 
     #[test]
