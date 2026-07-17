@@ -30,12 +30,12 @@ pub use services::get::{
 pub use services::provider::{
     build_retrieve_presentation_contexts, find_responses, DestinationLookup, FindEvent,
     FindResponseStream, FindServiceProvider, GetEvent, GetRetrievePlan, GetServiceProvider,
-    MoveEvent, MoveRetrievePlan, MoveServiceProvider, RetrieveItem, RetrievePresentationContext,
-    RetrieveSubOperation, StaticDestinationLookup, StoreEvent, StoreResult, StoreServiceProvider,
-    StreamingFindServiceProvider, StreamingGetServiceProvider, StreamingMoveServiceProvider,
-    StreamingRetrieveItem, StreamingRetrieveItemStream, STATUS_CANCEL, STATUS_PENDING,
-    STATUS_PROCESSING_FAILURE, STATUS_SUCCESS, STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
-    STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
+    MoveEvent, MoveRetrievePlan, MoveServiceProvider, RetrieveCompletion, RetrieveItem,
+    RetrievePresentationContext, RetrieveSubOperation, StaticDestinationLookup, StoreEvent,
+    StoreResult, StoreServiceProvider, StreamingFindServiceProvider, StreamingGetServiceProvider,
+    StreamingMoveServiceProvider, StreamingRetrieveItem, StreamingRetrieveItemStream,
+    STATUS_CANCEL, STATUS_PENDING, STATUS_PROCESSING_FAILURE, STATUS_SUCCESS,
+    STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS, STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
 };
 pub use services::r#move::{
     c_move, handle_move_rq, handle_streaming_move_rq, MoveRequest, MoveResponse,

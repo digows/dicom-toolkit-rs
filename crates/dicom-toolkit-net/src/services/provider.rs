@@ -59,6 +59,39 @@ pub type FindResponseStream = Pin<Box<dyn Stream<Item = DcmResult<DataSet>> + Se
 pub type StreamingRetrieveItemStream =
     Pin<Box<dyn Stream<Item = DcmResult<RetrieveSubOperation>> + Send + 'static>>;
 
+/// Terminal outcome of a streaming C-GET or C-MOVE execution.
+///
+/// The callback attached to a retrieval plan receives exactly one outcome.
+/// `Aborted` covers transport or protocol failures that prevent the service
+/// from sending its final DIMSE response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrieveCompletion {
+    /// The service reached a terminal DIMSE response.
+    Finished {
+        /// Number of sub-operations declared by the provider.
+        total: u16,
+        /// Number of successful C-STORE sub-operations.
+        completed: u16,
+        /// Number of failed C-STORE sub-operations.
+        failed: u16,
+        /// Number of C-STORE sub-operations completed with a warning.
+        warning: u16,
+        /// Whether the requestor cancelled the retrieve.
+        cancelled: bool,
+        /// Whether the provider stream failed or violated its declaration.
+        provider_failed: bool,
+        /// Final DIMSE status sent to the requestor.
+        final_status: u16,
+    },
+    /// The association ended before a final DIMSE response could be sent.
+    Aborted {
+        /// Number of sub-operations declared by the provider.
+        total: u16,
+    },
+}
+
+type RetrieveCompletionCallback = Box<dyn FnOnce(RetrieveCompletion) + Send + 'static>;
+
 /// Convert an in-memory list into a C-FIND response stream.
 ///
 /// This is convenient for small result sets. Providers handling large queries
@@ -245,6 +278,7 @@ impl RetrievePresentationContext {
 pub struct GetRetrievePlan {
     total_suboperations: u16,
     items: StreamingRetrieveItemStream,
+    completion_callback: Option<RetrieveCompletionCallback>,
 }
 
 impl fmt::Debug for GetRetrievePlan {
@@ -262,6 +296,7 @@ impl GetRetrievePlan {
         Self {
             total_suboperations,
             items,
+            completion_callback: None,
         }
     }
 
@@ -294,8 +329,27 @@ impl GetRetrievePlan {
         self.total_suboperations
     }
 
-    pub(crate) fn into_parts(self) -> (u16, StreamingRetrieveItemStream) {
-        (self.total_suboperations, self.items)
+    /// Attach a callback invoked exactly once when execution finishes or aborts.
+    pub fn with_completion_callback(
+        mut self,
+        callback: impl FnOnce(RetrieveCompletion) + Send + 'static,
+    ) -> Self {
+        self.completion_callback = Some(Box::new(callback));
+        self
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        u16,
+        StreamingRetrieveItemStream,
+        Option<RetrieveCompletionCallback>,
+    ) {
+        (
+            self.total_suboperations,
+            self.items,
+            self.completion_callback,
+        )
     }
 }
 
@@ -307,6 +361,7 @@ pub struct MoveRetrievePlan {
     total_suboperations: u16,
     presentation_contexts: Vec<RetrievePresentationContext>,
     items: StreamingRetrieveItemStream,
+    completion_callback: Option<RetrieveCompletionCallback>,
 }
 
 impl fmt::Debug for MoveRetrievePlan {
@@ -336,6 +391,7 @@ impl MoveRetrievePlan {
             total_suboperations,
             presentation_contexts,
             items,
+            completion_callback: None,
         })
     }
 
@@ -374,17 +430,28 @@ impl MoveRetrievePlan {
         &self.presentation_contexts
     }
 
+    /// Attach a callback invoked exactly once when execution finishes or aborts.
+    pub fn with_completion_callback(
+        mut self,
+        callback: impl FnOnce(RetrieveCompletion) + Send + 'static,
+    ) -> Self {
+        self.completion_callback = Some(Box::new(callback));
+        self
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
         u16,
         Vec<RetrievePresentationContext>,
         StreamingRetrieveItemStream,
+        Option<RetrieveCompletionCallback>,
     ) {
         (
             self.total_suboperations,
             self.presentation_contexts,
             self.items,
+            self.completion_callback,
         )
     }
 }

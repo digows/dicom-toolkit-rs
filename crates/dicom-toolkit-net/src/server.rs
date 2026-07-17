@@ -268,6 +268,7 @@ pub struct DicomServer {
     move_destination_config: Arc<AssociationConfig>,
     move_destination_options: Arc<AssociationOptions>,
     streaming_move_pending_response_interval: Option<Duration>,
+    streaming_move_destination_associations: usize,
     max_associations: usize,
     graceful_shutdown_timeout: Option<Duration>,
     token: CancellationToken,
@@ -342,6 +343,8 @@ impl DicomServer {
                             let move_destination_options = Arc::clone(&self.move_destination_options);
                             let streaming_move_pending_response_interval =
                                 self.streaming_move_pending_response_interval;
+                            let streaming_move_destination_associations =
+                                self.streaming_move_destination_associations;
 
                             connection_tasks.spawn(async move {
                                 let _permit = permit;
@@ -355,6 +358,7 @@ impl DicomServer {
                                         move_destination: &move_destination_config,
                                         move_destination_options: &move_destination_options,
                                         streaming_move_pending_response_interval,
+                                        streaming_move_destination_associations,
                                     },
                                 )
                                 .await
@@ -411,6 +415,7 @@ struct ConnectionConfiguration<'a> {
     move_destination: &'a AssociationConfig,
     move_destination_options: &'a AssociationOptions,
     streaming_move_pending_response_interval: Option<Duration>,
+    streaming_move_destination_associations: usize,
 }
 
 async fn handle_connection(
@@ -568,6 +573,7 @@ async fn handle_connection(
                                 configuration.move_destination,
                                 configuration.move_destination_options,
                                 configuration.streaming_move_pending_response_interval,
+                                configuration.streaming_move_destination_associations,
                             )
                             .await?;
                         }
@@ -630,6 +636,7 @@ pub struct DicomServerBuilder {
     move_destination_config: Option<AssociationConfig>,
     move_destination_options: Option<AssociationOptions>,
     streaming_move_pending_response_interval: Option<Duration>,
+    streaming_move_destination_associations: usize,
     store: Option<Arc<dyn AnyStoreProvider>>,
     find: Option<FindProviderRegistration>,
     get: Option<GetProviderRegistration>,
@@ -649,6 +656,7 @@ impl Default for DicomServerBuilder {
             move_destination_config: None,
             move_destination_options: None,
             streaming_move_pending_response_interval: None,
+            streaming_move_destination_associations: 1,
             store: None,
             find: None,
             get: None,
@@ -724,6 +732,17 @@ impl DicomServerBuilder {
         self
     }
 
+    /// Set the maximum number of synchronous Storage associations used by one
+    /// streaming C-MOVE operation.
+    ///
+    /// The default is one, preserving the serial behavior of earlier
+    /// releases. Values greater than one allow bounded parallel C-STORE
+    /// delivery when the destination accepts multiple associations.
+    pub fn streaming_move_destination_associations(mut self, maximum: usize) -> Self {
+        self.streaming_move_destination_associations = maximum;
+        self
+    }
+
     /// Register a C-STORE provider.
     pub fn store_provider(mut self, p: impl StoreServiceProvider) -> Self {
         self.store = Some(Arc::new(p));
@@ -784,6 +803,11 @@ impl DicomServerBuilder {
         {
             return Err(dicom_toolkit_core::error::DcmError::Other(
                 "streaming C-MOVE Pending response interval must be greater than zero".into(),
+            ));
+        }
+        if self.streaming_move_destination_associations == 0 {
+            return Err(dicom_toolkit_core::error::DcmError::Other(
+                "streaming C-MOVE destination association count must be greater than zero".into(),
             ));
         }
         let ae = self.ae_title.clone();
@@ -870,6 +894,7 @@ impl DicomServerBuilder {
             move_destination_config: Arc::new(move_destination_config),
             move_destination_options: Arc::new(move_destination_options),
             streaming_move_pending_response_interval: self.streaming_move_pending_response_interval,
+            streaming_move_destination_associations: self.streaming_move_destination_associations,
             max_associations: self.max_associations,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             token: CancellationToken::new(),

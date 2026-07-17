@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 
 use crate::association::Association;
 use crate::services::provider::{
-    GetEvent, GetRetrievePlan, GetServiceProvider, RetrieveSubOperation,
+    GetEvent, GetRetrievePlan, GetServiceProvider, RetrieveCompletion, RetrieveSubOperation,
     StreamingGetServiceProvider, StreamingRetrieveItem, StreamingRetrieveItemStream, STATUS_CANCEL,
     STATUS_DATASET_MISMATCH, STATUS_SUCCESS, STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
     STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
@@ -361,7 +361,8 @@ async fn execute_get_plan(
     plan: GetRetrievePlan,
     enforce_negotiated_role: bool,
 ) -> DcmResult<()> {
-    let (total, mut items) = plan.into_parts();
+    let (total, mut items, completion_callback) = plan.into_parts();
+    let mut completion_notifier = RetrieveCompletionNotifier::new(total, completion_callback);
     let mut completed: u16 = 0;
     let mut failed: u16 = 0;
     let mut warning: u16 = 0;
@@ -661,7 +662,7 @@ async fn execute_get_plan(
         "C-GET retrieval plan execution completed"
     );
 
-    send_final_response_with_failures(
+    let response_result = send_final_response_with_failures(
         assoc,
         ctx_id,
         sop_class,
@@ -679,7 +680,47 @@ async fn execute_get_plan(
         },
         &failed_sop_instance_uids,
     )
-    .await
+    .await;
+    if response_result.is_ok() {
+        completion_notifier.finish(RetrieveCompletion::Finished {
+            total,
+            completed,
+            failed,
+            warning,
+            cancelled,
+            provider_failed,
+            final_status,
+        });
+    }
+    response_result
+}
+
+struct RetrieveCompletionNotifier {
+    total: u16,
+    callback: Option<Box<dyn FnOnce(RetrieveCompletion) + Send + 'static>>,
+}
+
+impl RetrieveCompletionNotifier {
+    fn new(
+        total: u16,
+        callback: Option<Box<dyn FnOnce(RetrieveCompletion) + Send + 'static>>,
+    ) -> Self {
+        Self { total, callback }
+    }
+
+    fn finish(&mut self, completion: RetrieveCompletion) {
+        if let Some(callback) = self.callback.take() {
+            callback(completion);
+        }
+    }
+}
+
+impl Drop for RetrieveCompletionNotifier {
+    fn drop(&mut self) {
+        if let Some(callback) = self.callback.take() {
+            callback(RetrieveCompletion::Aborted { total: self.total });
+        }
+    }
 }
 
 enum NextGetOutcome {
@@ -815,7 +856,11 @@ fn is_warning_status(status: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::RetrieveCompletionNotifier;
     use crate::dimse;
+    use crate::services::provider::{RetrieveCompletion, STATUS_SUCCESS};
     use dicom_toolkit_data::DataSet;
     use dicom_toolkit_dict::tags;
 
@@ -879,5 +924,49 @@ mod tests {
             decoded.get_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS),
             Some(7)
         );
+    }
+
+    #[test]
+    fn completion_notifier_reports_abort_when_execution_exits_early() {
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        {
+            let _notifier = RetrieveCompletionNotifier::new(
+                7,
+                Some(Box::new(move |completion| {
+                    *callback_observed.lock().unwrap() = Some(completion);
+                })),
+            );
+        }
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(RetrieveCompletion::Aborted { total: 7 })
+        );
+    }
+
+    #[test]
+    fn completion_notifier_invokes_callback_only_once_after_success() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        {
+            let mut notifier = RetrieveCompletionNotifier::new(
+                3,
+                Some(Box::new(move |completion| {
+                    callback_observed.lock().unwrap().push(completion);
+                })),
+            );
+            notifier.finish(RetrieveCompletion::Finished {
+                total: 3,
+                completed: 3,
+                failed: 0,
+                warning: 0,
+                cancelled: false,
+                provider_failed: false,
+                final_status: STATUS_SUCCESS,
+            });
+        }
+
+        assert_eq!(observed.lock().unwrap().len(), 1);
     }
 }

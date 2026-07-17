@@ -1,5 +1,6 @@
 //! C-MOVE (Query/Retrieve — Move Service) — PS3.4 §C.4.2.
 
+use std::collections::VecDeque;
 use std::future::pending;
 use std::time::Duration;
 
@@ -7,15 +8,19 @@ use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, io::writer::DicomWriter, DataSet};
 use dicom_toolkit_dict::{tags, Tag, Vr};
 use futures_util::StreamExt;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::association::Association;
 use crate::config::AssociationConfig;
 use crate::presentation::PresentationContextRq;
 use crate::services::provider::{
-    DestinationLookup, MoveEvent, MoveServiceProvider, RetrieveSubOperation,
-    StreamingMoveServiceProvider, STATUS_CANCEL, STATUS_DATASET_MISMATCH, STATUS_SUCCESS,
-    STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS, STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
+    DestinationLookup, MoveEvent, MoveRetrievePlan, MoveServiceProvider, RetrieveCompletion,
+    RetrieveSubOperation, StreamingMoveServiceProvider, StreamingRetrieveItem, STATUS_CANCEL,
+    STATUS_DATASET_MISMATCH, STATUS_SUCCESS, STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
+    STATUS_UNABLE_TO_PROCESS, STATUS_WARNING,
 };
 use crate::services::recv_command_data_bytes;
 use crate::services::store::{
@@ -334,6 +339,7 @@ where
         association_config,
         association_options,
         None,
+        1,
     )
     .await
 }
@@ -349,6 +355,7 @@ pub(crate) async fn handle_streaming_move_rq_with_pending_response_interval<P, L
     association_config: &AssociationConfig,
     association_options: &crate::config::AssociationOptions,
     pending_response_interval: Option<Duration>,
+    maximum_destination_associations: usize,
 ) -> DcmResult<()>
 where
     P: StreamingMoveServiceProvider,
@@ -425,10 +432,28 @@ where
             .await;
         }
     };
-    let (total, storage_contexts, mut items) = plan.into_parts();
+    if maximum_destination_associations > 1 {
+        return execute_parallel_move_plan(
+            assoc,
+            ctx_id,
+            &sop_class,
+            msg_id,
+            &destination,
+            &dest_addr,
+            local_ae,
+            association_config,
+            association_options,
+            pending_response_interval,
+            maximum_destination_associations,
+            plan,
+        )
+        .await;
+    }
+    let (total, storage_contexts, mut items, completion_callback) = plan.into_parts();
+    let mut completion_notifier = RetrieveCompletionNotifier::new(total, completion_callback);
 
     if total == 0 {
-        return send_final_response(
+        let response_result = send_final_response(
             assoc,
             ctx_id,
             &sop_class,
@@ -437,6 +462,18 @@ where
             SubOperationCounts::default(),
         )
         .await;
+        if response_result.is_ok() {
+            completion_notifier.finish(RetrieveCompletion::Finished {
+                total,
+                completed: 0,
+                failed: 0,
+                warning: 0,
+                cancelled: false,
+                provider_failed: false,
+                final_status: STATUS_SUCCESS,
+            });
+        }
+        return response_result;
     }
 
     info!(
@@ -501,7 +538,7 @@ where
         Ok(a) => a,
         Err(error) => {
             warn!(%error, destination = %destination, "C-MOVE destination association failed");
-            return send_final_response(
+            let response_result = send_final_response(
                 assoc,
                 ctx_id,
                 &sop_class,
@@ -515,6 +552,18 @@ where
                 },
             )
             .await;
+            if response_result.is_ok() {
+                completion_notifier.finish(RetrieveCompletion::Finished {
+                    total,
+                    completed: 0,
+                    failed: total,
+                    warning: 0,
+                    cancelled: false,
+                    provider_failed: true,
+                    final_status: STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
+                });
+            }
+            return response_result;
         }
     };
 
@@ -849,7 +898,7 @@ where
         "C-MOVE retrieval plan execution completed"
     );
 
-    send_final_response_with_failures(
+    let response_result = send_final_response_with_failures(
         assoc,
         ctx_id,
         &sop_class,
@@ -867,7 +916,573 @@ where
         },
         &failed_sop_instance_uids,
     )
-    .await
+    .await;
+    if response_result.is_ok() {
+        completion_notifier.finish(RetrieveCompletion::Finished {
+            total,
+            completed,
+            failed,
+            warning,
+            cancelled,
+            provider_failed,
+            final_status,
+        });
+    }
+    response_result
+}
+
+struct RetrieveCompletionNotifier {
+    total: u16,
+    callback: Option<Box<dyn FnOnce(RetrieveCompletion) + Send + 'static>>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn execute_parallel_move_plan(
+    request_association: &mut Association,
+    context_id: u8,
+    sop_class: &str,
+    message_id: u16,
+    destination: &str,
+    destination_address: &str,
+    local_ae: &str,
+    association_config: &AssociationConfig,
+    association_options: &crate::config::AssociationOptions,
+    pending_response_interval: Option<Duration>,
+    maximum_destination_associations: usize,
+    plan: MoveRetrievePlan,
+) -> DcmResult<()> {
+    let (total, storage_contexts, mut items, completion_callback) = plan.into_parts();
+    let mut completion_notifier = RetrieveCompletionNotifier::new(total, completion_callback);
+    if total == 0 {
+        let response_result = send_final_response(
+            request_association,
+            context_id,
+            sop_class,
+            message_id,
+            STATUS_SUCCESS,
+            SubOperationCounts::default(),
+        )
+        .await;
+        if response_result.is_ok() {
+            completion_notifier.finish(RetrieveCompletion::Finished {
+                total,
+                completed: 0,
+                failed: 0,
+                warning: 0,
+                cancelled: false,
+                provider_failed: false,
+                final_status: STATUS_SUCCESS,
+            });
+        }
+        return response_result;
+    }
+
+    send_pending_response(
+        request_association,
+        sop_class,
+        context_id,
+        message_id,
+        SubOperationCounts {
+            remaining: total,
+            completed: 0,
+            failed: 0,
+            warning: 0,
+        },
+    )
+    .await?;
+
+    let sub_contexts: Vec<PresentationContextRq> = storage_contexts
+        .iter()
+        .enumerate()
+        .map(|(index, context)| PresentationContextRq {
+            id: (index * 2 + 1) as u8,
+            abstract_syntax: context.sop_class_uid.clone(),
+            transfer_syntaxes: vec![context.transfer_syntax_uid.clone()],
+        })
+        .collect();
+    let mut sub_config = association_config.clone();
+    sub_config.local_ae_title = local_ae.to_string();
+    let cancellation = CancellationToken::new();
+    let (result_sender, mut result_receiver) = mpsc::unbounded_channel();
+    let mut worker_tasks = JoinSet::new();
+    let mut worker_senders = Vec::new();
+    let requested_worker_count = maximum_destination_associations.min(usize::from(total));
+
+    for worker_index in 0..requested_worker_count {
+        match Association::request_with_options(
+            destination_address,
+            destination,
+            local_ae,
+            &sub_contexts,
+            &sub_config,
+            association_options,
+        )
+        .await
+        {
+            Ok(association) => {
+                let (task_sender, task_receiver) = mpsc::channel(1);
+                worker_senders.push(Some(task_sender));
+                worker_tasks.spawn(run_storage_worker(
+                    worker_index,
+                    association,
+                    task_receiver,
+                    result_sender.clone(),
+                    cancellation.clone(),
+                    destination.to_owned(),
+                    destination_address.to_owned(),
+                ));
+            }
+            Err(error) if worker_senders.is_empty() => {
+                warn!(
+                    %error,
+                    destination,
+                    destination_address,
+                    "C-MOVE destination association failed"
+                );
+                let response_result = send_final_response(
+                    request_association,
+                    context_id,
+                    sop_class,
+                    message_id,
+                    STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
+                    SubOperationCounts {
+                        remaining: 0,
+                        completed: 0,
+                        failed: total,
+                        warning: 0,
+                    },
+                )
+                .await;
+                if response_result.is_ok() {
+                    completion_notifier.finish(RetrieveCompletion::Finished {
+                        total,
+                        completed: 0,
+                        failed: total,
+                        warning: 0,
+                        cancelled: false,
+                        provider_failed: true,
+                        final_status: STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS,
+                    });
+                }
+                return response_result;
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    worker_index,
+                    destination,
+                    destination_address,
+                    "additional C-MOVE destination association failed; using smaller pool"
+                );
+                break;
+            }
+        }
+    }
+    drop(result_sender);
+
+    info!(
+        dimse_service = "C-MOVE",
+        calling_ae = %request_association.calling_ae.trim(),
+        called_ae = %request_association.called_ae.trim(),
+        destination_ae = destination,
+        destination_address,
+        information_model = sop_class,
+        total_suboperations = total,
+        requested_storage_association_count = requested_worker_count,
+        active_storage_association_count = worker_senders.len(),
+        proposed_storage_presentation_context_count = storage_contexts.len(),
+        "parallel C-MOVE retrieval plan execution started"
+    );
+
+    let mut idle_workers = (0..worker_senders.len()).collect::<VecDeque<_>>();
+    let mut active_suboperations = 0_usize;
+    let mut stream_ended = false;
+    let mut completed = 0_u16;
+    let mut failed = 0_u16;
+    let mut warning = 0_u16;
+    let mut cancelled = false;
+    let mut provider_failed = false;
+    let mut failed_sop_instance_uids = Vec::new();
+    let mut request_error = None;
+
+    while active_suboperations != 0 || !stream_ended {
+        if idle_workers.is_empty() && active_suboperations == 0 && !stream_ended {
+            provider_failed = true;
+            break;
+        }
+
+        let counts = sub_operation_counts(total, completed, failed, warning);
+        tokio::select! {
+            item = items.next(), if !stream_ended && !idle_workers.is_empty() => {
+                match item {
+                    Some(Ok(RetrieveSubOperation::Ready(item))) => {
+                        let worker_index = idle_workers.pop_front().expect("idle worker available");
+                        let task = StorageWorkerTask { item };
+                        let send_result = match worker_senders
+                            .get(worker_index)
+                            .and_then(Option::as_ref)
+                        {
+                            Some(sender) => sender.send(task).await,
+                            None => Err(mpsc::error::SendError(task)),
+                        };
+                        if let Err(error) = send_result {
+                            failed = failed.saturating_add(1);
+                            failed_sop_instance_uids.push(error.0.item.sop_instance_uid);
+                            if let Some(sender) = worker_senders.get_mut(worker_index) {
+                                *sender = None;
+                            }
+                        } else {
+                            active_suboperations += 1;
+                        }
+                    }
+                    Some(Ok(RetrieveSubOperation::Failed { sop_instance_uid, reason })) => {
+                        warn!(%sop_instance_uid, %reason, "C-MOVE instance failed before C-STORE");
+                        failed = failed.saturating_add(1);
+                        failed_sop_instance_uids.push(sop_instance_uid);
+                    }
+                    Some(Err(error)) => {
+                        warn!(%error, "parallel C-MOVE retrieval stream failed");
+                        provider_failed = true;
+                        stream_ended = true;
+                    }
+                    None => stream_ended = true,
+                }
+                if failed > counts.failed {
+                    if let Err(error) = send_pending_response(
+                        request_association,
+                        sop_class,
+                        context_id,
+                        message_id,
+                        sub_operation_counts(total, completed, failed, warning),
+                    ).await {
+                        request_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            result = result_receiver.recv(), if active_suboperations != 0 => {
+                let Some(result) = result else {
+                    provider_failed = true;
+                    break;
+                };
+                active_suboperations = active_suboperations.saturating_sub(1);
+                if result.worker_reusable {
+                    idle_workers.push_back(result.worker_index);
+                } else if let Some(sender) = worker_senders.get_mut(result.worker_index) {
+                    *sender = None;
+                }
+                match result.outcome {
+                    StorageWorkerOutcome::Success => completed = completed.saturating_add(1),
+                    StorageWorkerOutcome::Warning => warning = warning.saturating_add(1),
+                    StorageWorkerOutcome::Failed(reason) => {
+                        warn!(
+                            sop_instance_uid = %result.sop_instance_uid,
+                            %reason,
+                            "parallel C-MOVE C-STORE sub-operation failed"
+                        );
+                        failed = failed.saturating_add(1);
+                        failed_sop_instance_uids.push(result.sop_instance_uid);
+                    }
+                    StorageWorkerOutcome::Cancelled => {
+                        if !cancelled {
+                            failed = failed.saturating_add(1);
+                            failed_sop_instance_uids.push(result.sop_instance_uid);
+                        }
+                    }
+                }
+                if let Err(error) = send_pending_response(
+                    request_association,
+                    sop_class,
+                    context_id,
+                    message_id,
+                    sub_operation_counts(total, completed, failed, warning),
+                ).await {
+                    request_error = Some(error);
+                    break;
+                }
+            }
+            readiness = request_association.wait_for_incoming_data() => {
+                match readiness {
+                    Err(error) => {
+                        request_error = Some(error);
+                        break;
+                    }
+                    Ok(()) => {
+                        loop {
+                            match request_association.try_recv_dimse_command() {
+                                Err(error) => {
+                                    request_error = Some(error);
+                                    break;
+                                }
+                                Ok(Some((_incoming_context_id, command)))
+                                    if is_matching_cancel(&command, message_id) =>
+                                {
+                                    cancelled = true;
+                                    stream_ended = true;
+                                    cancellation.cancel();
+                                }
+                                Ok(Some((_incoming_context_id, command)))
+                                    if command.get_u16(tags::COMMAND_FIELD) == Some(0x0FFF) => {}
+                                Ok(Some((incoming_context_id, command))) => {
+                                    request_association.queue_dimse_command(incoming_context_id, command);
+                                    request_error = Some(dicom_toolkit_core::error::DcmError::Other(
+                                        "unexpected DIMSE command during active parallel C-MOVE".into(),
+                                    ));
+                                    break;
+                                }
+                                Ok(None) => break,
+                            }
+                        }
+                        if request_error.is_some() || cancelled {
+                            break;
+                        }
+                    }
+                }
+            }
+            () = wait_for_pending_heartbeat(pending_response_interval) => {
+                if let Err(error) = send_pending_response(
+                    request_association,
+                    sop_class,
+                    context_id,
+                    message_id,
+                    counts,
+                ).await {
+                    request_error = Some(error);
+                    break;
+                }
+                log_pending_heartbeat(
+                    request_association,
+                    "parallel_c_store",
+                    None,
+                    counts,
+                );
+            }
+        }
+    }
+
+    if cancelled || request_error.is_some() {
+        cancellation.cancel();
+    }
+    drop(worker_senders);
+    while let Some(result) = worker_tasks.join_next().await {
+        if let Err(error) = result {
+            warn!(%error, "parallel C-MOVE Storage worker failed");
+        }
+    }
+
+    if let Some(error) = request_error {
+        return Err(error);
+    }
+
+    let accounted = completed.saturating_add(failed).saturating_add(warning);
+    if accounted < total && !cancelled {
+        failed = failed.saturating_add(total - accounted);
+        provider_failed = true;
+    }
+    let final_status = if cancelled {
+        STATUS_CANCEL
+    } else if provider_failed || (failed > 0 && completed == 0 && warning == 0) {
+        STATUS_UNABLE_TO_PERFORM_SUBOPERATIONS
+    } else if failed > 0 || warning > 0 {
+        STATUS_WARNING
+    } else {
+        STATUS_SUCCESS
+    };
+
+    info!(
+        dimse_service = "C-MOVE",
+        calling_ae = %request_association.calling_ae.trim(),
+        called_ae = %request_association.called_ae.trim(),
+        destination_ae = destination,
+        destination_address,
+        information_model = sop_class,
+        total_suboperations = total,
+        completed_suboperations = completed,
+        failed_suboperations = failed,
+        warning_suboperations = warning,
+        cancelled,
+        provider_failed,
+        final_status = format_args!("0x{final_status:04X}"),
+        "parallel C-MOVE retrieval plan execution completed"
+    );
+
+    let response_result = send_final_response_with_failures(
+        request_association,
+        context_id,
+        sop_class,
+        message_id,
+        final_status,
+        SubOperationCounts {
+            remaining: if cancelled {
+                total.saturating_sub(completed.saturating_add(failed).saturating_add(warning))
+            } else {
+                0
+            },
+            completed,
+            failed,
+            warning,
+        },
+        &failed_sop_instance_uids,
+    )
+    .await;
+    if response_result.is_ok() {
+        completion_notifier.finish(RetrieveCompletion::Finished {
+            total,
+            completed,
+            failed,
+            warning,
+            cancelled,
+            provider_failed,
+            final_status,
+        });
+    }
+    response_result
+}
+
+struct StorageWorkerTask {
+    item: StreamingRetrieveItem,
+}
+
+struct StorageWorkerResult {
+    worker_index: usize,
+    sop_instance_uid: String,
+    outcome: StorageWorkerOutcome,
+    worker_reusable: bool,
+}
+
+enum StorageWorkerOutcome {
+    Success,
+    Warning,
+    Failed(String),
+    Cancelled,
+}
+
+async fn run_storage_worker(
+    worker_index: usize,
+    mut association: Association,
+    mut task_receiver: mpsc::Receiver<StorageWorkerTask>,
+    result_sender: mpsc::UnboundedSender<StorageWorkerResult>,
+    cancellation: CancellationToken,
+    destination: String,
+    destination_address: String,
+) {
+    info!(
+        worker_index,
+        destination_ae = %destination,
+        destination_address = %destination_address,
+        accepted_storage_presentation_context_count = association.presentation_contexts.len(),
+        "parallel C-MOVE Storage association ready"
+    );
+    let mut aborted = false;
+    loop {
+        let task = tokio::select! {
+            () = cancellation.cancelled() => {
+                aborted = true;
+                break;
+            }
+            task = task_receiver.recv() => {
+                let Some(task) = task else { break; };
+                task
+            }
+        };
+        let sop_instance_uid = task.item.sop_instance_uid.clone();
+        let context_id = association
+            .find_context_for_scu_with_transfer_syntax(
+                &task.item.sop_class_uid,
+                &task.item.transfer_syntax_uid,
+            )
+            .map(|context| context.id);
+        let Some(context_id) = context_id else {
+            let _ = result_sender.send(StorageWorkerResult {
+                worker_index,
+                sop_instance_uid,
+                outcome: StorageWorkerOutcome::Failed(
+                    "destination accepted no compatible presentation context".to_owned(),
+                ),
+                worker_reusable: true,
+            });
+            continue;
+        };
+        let request = StoreSourceRequest {
+            sop_class_uid: task.item.sop_class_uid,
+            sop_instance_uid: task.item.sop_instance_uid,
+            priority: 0,
+            dataset: task.item.dataset,
+            context_id,
+        };
+        let (outcome, worker_reusable) =
+            match c_store_source_abort_on_cancel(&mut association, request, &cancellation).await {
+                Ok(CancellableStoreOutcome::Response(response))
+                    if response.status == STATUS_SUCCESS =>
+                {
+                    (StorageWorkerOutcome::Success, true)
+                }
+                Ok(CancellableStoreOutcome::Response(response))
+                    if is_warning_status(response.status) =>
+                {
+                    (StorageWorkerOutcome::Warning, true)
+                }
+                Ok(CancellableStoreOutcome::Response(response)) => (
+                    StorageWorkerOutcome::Failed(format!(
+                        "destination returned C-STORE status 0x{:04X}",
+                        response.status
+                    )),
+                    true,
+                ),
+                Ok(CancellableStoreOutcome::Aborted) => {
+                    aborted = true;
+                    (StorageWorkerOutcome::Cancelled, false)
+                }
+                Err(error) => {
+                    aborted = true;
+                    (StorageWorkerOutcome::Failed(error.to_string()), false)
+                }
+            };
+        let _ = result_sender.send(StorageWorkerResult {
+            worker_index,
+            sop_instance_uid,
+            outcome,
+            worker_reusable,
+        });
+        if !worker_reusable {
+            break;
+        }
+    }
+
+    if aborted || cancellation.is_cancelled() {
+        let _ = association.abort_strict().await;
+    } else if let Err(error) = association.release_strict().await {
+        warn!(
+            worker_index,
+            destination_ae = %destination,
+            destination_address = %destination_address,
+            %error,
+            "parallel C-MOVE Storage association release failed"
+        );
+    }
+}
+
+impl RetrieveCompletionNotifier {
+    fn new(
+        total: u16,
+        callback: Option<Box<dyn FnOnce(RetrieveCompletion) + Send + 'static>>,
+    ) -> Self {
+        Self { total, callback }
+    }
+
+    fn finish(&mut self, completion: RetrieveCompletion) {
+        if let Some(callback) = self.callback.take() {
+            callback(completion);
+        }
+    }
+}
+
+impl Drop for RetrieveCompletionNotifier {
+    fn drop(&mut self) {
+        if let Some(callback) = self.callback.take() {
+            callback(RetrieveCompletion::Aborted { total: self.total });
+        }
+    }
 }
 
 enum NextMoveOutcome {
