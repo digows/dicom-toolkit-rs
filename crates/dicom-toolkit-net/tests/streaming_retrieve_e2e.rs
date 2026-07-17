@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,12 +12,13 @@ use dicom_toolkit_net::{
     c_get, Association, AssociationConfig, AssociationOptions, DatasetSource, DicomServer,
     GetEvent, GetRequest, GetRetrievePlan, MoveEvent, MoveRetrievePlan,
     RetrievePresentationContext, RetrieveSubOperation, ScpScuRoleSelection,
-    StaticDestinationLookup, StreamingGetServiceProvider, StreamingMoveServiceProvider,
-    StreamingRetrieveItem, StreamingRetrieveItemStream, STATUS_CANCEL, STATUS_WARNING,
+    StaticDestinationLookup, StoreEvent, StoreResult, StoreServiceProvider,
+    StreamingGetServiceProvider, StreamingMoveServiceProvider, StreamingRetrieveItem,
+    StreamingRetrieveItemStream, STATUS_CANCEL, STATUS_WARNING,
 };
 use futures_util::stream;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Barrier};
 use tokio::time::timeout;
 
 const TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2.1";
@@ -219,6 +220,26 @@ struct FixedStreamingMoveProvider {
     items: Vec<StreamingRetrieveItem>,
 }
 
+#[derive(Clone)]
+struct ConcurrentStoreProvider {
+    synchronization_barrier: Arc<Barrier>,
+    active_operations: Arc<AtomicUsize>,
+    maximum_active_operations: Arc<AtomicUsize>,
+    stored_operations: Arc<AtomicUsize>,
+}
+
+impl StoreServiceProvider for ConcurrentStoreProvider {
+    async fn on_store(&self, _event: StoreEvent) -> StoreResult {
+        let active_operations = self.active_operations.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum_active_operations
+            .fetch_max(active_operations, Ordering::SeqCst);
+        self.synchronization_barrier.wait().await;
+        self.stored_operations.fetch_add(1, Ordering::SeqCst);
+        self.active_operations.fetch_sub(1, Ordering::SeqCst);
+        StoreResult::success()
+    }
+}
+
 impl StreamingMoveServiceProvider for FixedStreamingMoveProvider {
     async fn on_move_stream(&self, _event: MoveEvent) -> DcmResult<MoveRetrievePlan> {
         MoveRetrievePlan::from_items(self.items.clone())
@@ -256,6 +277,132 @@ impl StreamingGetServiceProvider for PendingStreamingGetProvider {
             }));
         Ok(GetRetrievePlan::new(3, items))
     }
+}
+
+#[tokio::test]
+async fn parallel_move_uses_the_configured_destination_association_pool() {
+    const DESTINATION_ASSOCIATIONS: usize = 3;
+    const INSTANCE_COUNT: usize = 6;
+
+    let active_operations = Arc::new(AtomicUsize::new(0));
+    let maximum_active_operations = Arc::new(AtomicUsize::new(0));
+    let stored_operations = Arc::new(AtomicUsize::new(0));
+    let destination_server = DicomServer::builder()
+        .ae_title("DESTINATION")
+        .port(0)
+        .store_provider(ConcurrentStoreProvider {
+            synchronization_barrier: Arc::new(Barrier::new(DESTINATION_ASSOCIATIONS)),
+            active_operations: Arc::clone(&active_operations),
+            maximum_active_operations: Arc::clone(&maximum_active_operations),
+            stored_operations: Arc::clone(&stored_operations),
+        })
+        .build()
+        .await
+        .expect("build destination server");
+    let destination_address = loopback_address(
+        destination_server
+            .local_addr()
+            .expect("destination address"),
+    );
+    let destination_cancellation_token = destination_server.cancellation_token();
+    let destination_server_task = tokio::spawn(async move { destination_server.run().await });
+
+    let items = (1..=INSTANCE_COUNT)
+        .map(|sequence| {
+            let sop_instance_uid = format!("1.2.826.0.1.20.{sequence}");
+            StreamingRetrieveItem {
+                sop_class_uid: sop_class::CT_IMAGE_STORAGE.to_string(),
+                sop_instance_uid: sop_instance_uid.clone(),
+                transfer_syntax_uid: TRANSFER_SYNTAX_EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                dataset: DatasetSource::bytes(encoded_instance(&sop_instance_uid)),
+            }
+        })
+        .collect();
+    let query_retrieve_server = DicomServer::builder()
+        .ae_title("MOVESCP")
+        .port(0)
+        .streaming_move_provider(FixedStreamingMoveProvider { items })
+        .streaming_move_destination_associations(DESTINATION_ASSOCIATIONS)
+        .move_destination_lookup(StaticDestinationLookup::new(vec![(
+            "DESTINATION".to_string(),
+            destination_address.to_string(),
+        )]))
+        .build()
+        .await
+        .expect("build query/retrieve server");
+    let query_retrieve_address = loopback_address(
+        query_retrieve_server
+            .local_addr()
+            .expect("query/retrieve address"),
+    );
+    let query_retrieve_cancellation_token = query_retrieve_server.cancellation_token();
+    let query_retrieve_server_task = tokio::spawn(async move { query_retrieve_server.run().await });
+
+    let mut association = Association::request(
+        &query_retrieve_address.to_string(),
+        "MOVESCP",
+        "MOVESCU",
+        &[query_retrieve_move_context(1)],
+        &AssociationConfig::default(),
+    )
+    .await
+    .expect("associate");
+    let query_context_id = association
+        .find_context(sop_class::PATIENT_ROOT_QR_MOVE)
+        .expect("query context")
+        .id;
+    association
+        .send_dimse_command(query_context_id, &move_request_command(49, "DESTINATION"))
+        .await
+        .expect("send C-MOVE-RQ");
+    association
+        .send_dimse_data(query_context_id, &query_identifier())
+        .await
+        .expect("send identifier");
+
+    let final_response = timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, response) = association
+                .recv_dimse_command()
+                .await
+                .expect("receive C-MOVE-RSP");
+            if response.get_u16(tags::STATUS) != Some(0xFF00) {
+                break response;
+            }
+        }
+    })
+    .await
+    .expect("parallel C-MOVE completes before timeout");
+
+    assert_eq!(final_response.get_u16(tags::STATUS), Some(0x0000));
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_COMPLETED_SUB_OPERATIONS),
+        Some(INSTANCE_COUNT as u16)
+    );
+    assert_eq!(
+        final_response.get_u16(tags::NUMBER_OF_FAILED_SUB_OPERATIONS),
+        Some(0)
+    );
+    assert_eq!(stored_operations.load(Ordering::SeqCst), INSTANCE_COUNT);
+    assert_eq!(
+        maximum_active_operations.load(Ordering::SeqCst),
+        DESTINATION_ASSOCIATIONS
+    );
+
+    association
+        .release()
+        .await
+        .expect("release request association");
+    query_retrieve_cancellation_token.cancel();
+    destination_cancellation_token.cancel();
+    query_retrieve_server_task
+        .await
+        .expect("query/retrieve server task")
+        .expect("query/retrieve server run");
+    destination_server_task
+        .await
+        .expect("destination server task")
+        .expect("destination server run");
 }
 
 #[tokio::test]
