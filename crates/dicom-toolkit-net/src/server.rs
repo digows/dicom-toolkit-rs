@@ -45,7 +45,9 @@ use crate::services::provider::{
     StreamingFindServiceProvider, StreamingGetServiceProvider, StreamingMoveServiceProvider,
     STATUS_UNRECOGNISED_OPERATION,
 };
-use crate::services::r#move::{handle_move_rq, handle_streaming_move_rq};
+use crate::services::r#move::{
+    handle_move_rq, handle_streaming_move_rq_with_pending_response_interval,
+};
 use crate::services::store::handle_store_rq;
 
 // ── Service registry ──────────────────────────────────────────────────────────
@@ -265,6 +267,7 @@ pub struct DicomServer {
     use_association_options: bool,
     move_destination_config: Arc<AssociationConfig>,
     move_destination_options: Arc<AssociationOptions>,
+    streaming_move_pending_response_interval: Option<Duration>,
     max_associations: usize,
     graceful_shutdown_timeout: Option<Duration>,
     token: CancellationToken,
@@ -337,17 +340,22 @@ impl DicomServer {
                             let use_association_options = self.use_association_options;
                             let move_destination_config = Arc::clone(&self.move_destination_config);
                             let move_destination_options = Arc::clone(&self.move_destination_options);
+                            let streaming_move_pending_response_interval =
+                                self.streaming_move_pending_response_interval;
 
                             connection_tasks.spawn(async move {
                                 let _permit = permit;
                                 match handle_connection(
                                     stream,
                                     &registry,
-                                    &config,
-                                    &association_options,
-                                    use_association_options,
-                                    &move_destination_config,
-                                    &move_destination_options,
+                                    ConnectionConfiguration {
+                                        association: &config,
+                                        association_options: &association_options,
+                                        use_association_options,
+                                        move_destination: &move_destination_config,
+                                        move_destination_options: &move_destination_options,
+                                        streaming_move_pending_response_interval,
+                                    },
                                 )
                                 .await
                                 {
@@ -396,24 +404,34 @@ impl DicomServer {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
+struct ConnectionConfiguration<'a> {
+    association: &'a AssociationConfig,
+    association_options: &'a AssociationOptions,
+    use_association_options: bool,
+    move_destination: &'a AssociationConfig,
+    move_destination_options: &'a AssociationOptions,
+    streaming_move_pending_response_interval: Option<Duration>,
+}
+
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     registry: &ServiceRegistry,
-    config: &AssociationConfig,
-    association_options: &AssociationOptions,
-    use_association_options: bool,
-    move_destination_config: &AssociationConfig,
-    move_destination_options: &AssociationOptions,
+    configuration: ConnectionConfiguration<'_>,
 ) -> DcmResult<()> {
     let peer = stream.peer_addr().ok();
     if let Some(addr) = peer {
         info!(%addr, "association accepted");
     }
 
-    let mut assoc = if use_association_options {
-        Association::accept_with_options(stream, config, association_options).await?
+    let mut assoc = if configuration.use_association_options {
+        Association::accept_with_options(
+            stream,
+            configuration.association,
+            configuration.association_options,
+        )
+        .await?
     } else {
-        Association::accept(stream, config).await?
+        Association::accept(stream, configuration.association).await?
     };
 
     info!(
@@ -540,15 +558,16 @@ async fn handle_connection(
                         }
                         MoveProviderRegistration::Streaming(provider) => {
                             let adapter = DynStreamingMoveAdapter(Arc::clone(provider));
-                            handle_streaming_move_rq(
+                            handle_streaming_move_rq_with_pending_response_interval(
                                 &mut assoc,
                                 ctx_id,
                                 &cmd,
                                 &adapter,
                                 registry.dest_lookup.as_ref(),
                                 &registry.local_ae,
-                                move_destination_config,
-                                move_destination_options,
+                                configuration.move_destination,
+                                configuration.move_destination_options,
+                                configuration.streaming_move_pending_response_interval,
                             )
                             .await?;
                         }
@@ -610,6 +629,7 @@ pub struct DicomServerBuilder {
     association_options: Option<AssociationOptions>,
     move_destination_config: Option<AssociationConfig>,
     move_destination_options: Option<AssociationOptions>,
+    streaming_move_pending_response_interval: Option<Duration>,
     store: Option<Arc<dyn AnyStoreProvider>>,
     find: Option<FindProviderRegistration>,
     get: Option<GetProviderRegistration>,
@@ -628,6 +648,7 @@ impl Default for DicomServerBuilder {
             association_options: None,
             move_destination_config: None,
             move_destination_options: None,
+            streaming_move_pending_response_interval: None,
             store: None,
             find: None,
             get: None,
@@ -692,6 +713,17 @@ impl DicomServerBuilder {
         self
     }
 
+    /// Set the interval between C-MOVE Pending responses while a streaming
+    /// provider or an active C-STORE sub-operation makes no visible progress.
+    ///
+    /// This is disabled by default to preserve earlier behavior. A bounded
+    /// interval keeps the request association active while a large object is
+    /// downloaded or delivered over the separate Storage association.
+    pub fn streaming_move_pending_response_interval(mut self, interval: Duration) -> Self {
+        self.streaming_move_pending_response_interval = Some(interval);
+        self
+    }
+
     /// Register a C-STORE provider.
     pub fn store_provider(mut self, p: impl StoreServiceProvider) -> Self {
         self.store = Some(Arc::new(p));
@@ -746,6 +778,14 @@ impl DicomServerBuilder {
     ///
     /// Returns an error if the port cannot be bound.
     pub async fn build(self) -> DcmResult<DicomServer> {
+        if self
+            .streaming_move_pending_response_interval
+            .is_some_and(|interval| interval.is_zero())
+        {
+            return Err(dicom_toolkit_core::error::DcmError::Other(
+                "streaming C-MOVE Pending response interval must be greater than zero".into(),
+            ));
+        }
         let ae = self.ae_title.clone();
         let config = self.config.unwrap_or_else(|| AssociationConfig {
             local_ae_title: ae.clone(),
@@ -829,6 +869,7 @@ impl DicomServerBuilder {
             use_association_options,
             move_destination_config: Arc::new(move_destination_config),
             move_destination_options: Arc::new(move_destination_options),
+            streaming_move_pending_response_interval: self.streaming_move_pending_response_interval,
             max_associations: self.max_associations,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             token: CancellationToken::new(),

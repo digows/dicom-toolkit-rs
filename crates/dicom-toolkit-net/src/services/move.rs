@@ -1,5 +1,8 @@
 //! C-MOVE (Query/Retrieve — Move Service) — PS3.4 §C.4.2.
 
+use std::future::pending;
+use std::time::Duration;
+
 use dicom_toolkit_core::error::DcmResult;
 use dicom_toolkit_data::{io::reader::DicomReader, io::writer::DicomWriter, DataSet};
 use dicom_toolkit_dict::{tags, Tag, Vr};
@@ -321,6 +324,36 @@ where
     P: StreamingMoveServiceProvider,
     L: DestinationLookup + ?Sized,
 {
+    handle_streaming_move_rq_with_pending_response_interval(
+        assoc,
+        ctx_id,
+        cmd,
+        provider,
+        dest_lookup,
+        local_ae,
+        association_config,
+        association_options,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_streaming_move_rq_with_pending_response_interval<P, L>(
+    assoc: &mut Association,
+    ctx_id: u8,
+    cmd: &DataSet,
+    provider: &P,
+    dest_lookup: &L,
+    local_ae: &str,
+    association_config: &AssociationConfig,
+    association_options: &crate::config::AssociationOptions,
+    pending_response_interval: Option<Duration>,
+) -> DcmResult<()>
+where
+    P: StreamingMoveServiceProvider,
+    L: DestinationLookup + ?Sized,
+{
     let sop_class = cmd
         .get_string(tags::AFFECTED_SOP_CLASS_UID)
         .unwrap_or_default()
@@ -513,10 +546,34 @@ where
     let mut failed_sop_instance_uids = Vec::new();
 
     loop {
-        let result = match next_move_outcome_or_cancel(assoc, &mut items, msg_id).await? {
-            NextMoveOutcome::Item(Some(result)) => result,
-            NextMoveOutcome::Item(None) => break,
-            NextMoveOutcome::Cancelled => {
+        let counts = sub_operation_counts(total, completed, failed, warning);
+        let pending_context = MovePendingResponseContext {
+            retrieve_message_id: msg_id,
+            sop_class: &sop_class,
+            context_id: ctx_id,
+            counts,
+            interval: pending_response_interval,
+            phase: "waiting_for_retrieve_item",
+            sop_instance_uid: None,
+        };
+        let next_outcome = next_move_outcome_or_cancel(assoc, &mut items, pending_context).await;
+        let result = match next_outcome {
+            Err(error) => {
+                log_request_association_interruption(
+                    assoc,
+                    &destination,
+                    &dest_addr,
+                    "waiting_for_retrieve_item",
+                    None,
+                    counts,
+                    &error,
+                );
+                abort_storage_after_request_failure(&mut sub_assoc, &destination, &error).await;
+                return Err(error);
+            }
+            Ok(NextMoveOutcome::Item(Some(result))) => result,
+            Ok(NextMoveOutcome::Item(None)) => break,
+            Ok(NextMoveOutcome::Cancelled) => {
                 cancelled = true;
                 break;
             }
@@ -561,6 +618,7 @@ where
                     },
                 )
                 .await?;
+                log_move_progress(total, completed, failed, warning, &destination, &dest_addr);
                 continue;
             }
         };
@@ -597,7 +655,34 @@ where
                 dataset: item.dataset,
                 context_id: store_context_id,
             };
-            match move_store_or_cancel(assoc, &mut sub_assoc, req, msg_id).await? {
+            let store_outcome = move_store_or_cancel(
+                assoc,
+                &mut sub_assoc,
+                req,
+                MovePendingResponseContext {
+                    phase: "waiting_for_c_store_response",
+                    sop_instance_uid: Some(&failed_sop_instance_uid),
+                    ..pending_context
+                },
+            )
+            .await;
+            let store_outcome = match store_outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    log_request_association_interruption(
+                        assoc,
+                        &destination,
+                        &dest_addr,
+                        "waiting_for_c_store_response",
+                        Some(&failed_sop_instance_uid),
+                        counts,
+                        &error,
+                    );
+                    abort_storage_after_request_failure(&mut sub_assoc, &destination, &error).await;
+                    return Err(error);
+                }
+            };
+            match store_outcome {
                 MoveStoreOutcome::Response(Ok(response)) if response.status == STATUS_SUCCESS => {
                     completed += 1;
                     debug!(
@@ -708,6 +793,7 @@ where
             },
         )
         .await?;
+        log_move_progress(total, completed, failed, warning, &destination, &dest_addr);
     }
 
     if cancelled {
@@ -715,7 +801,15 @@ where
             warn!(%error, "failed to send A-ABORT on cancelled C-MOVE storage association");
         }
     } else {
-        let _ = sub_assoc.release().await;
+        if let Err(error) = sub_assoc.release_strict().await {
+            warn!(
+                dimse_service = "C-MOVE",
+                destination_ae = %destination,
+                destination_address = %dest_addr,
+                %error,
+                "C-MOVE destination association release failed"
+            );
+        }
     }
 
     let accounted = completed.saturating_add(failed).saturating_add(warning);
@@ -781,10 +875,21 @@ enum NextMoveOutcome {
     Cancelled,
 }
 
+#[derive(Clone, Copy)]
+struct MovePendingResponseContext<'a> {
+    retrieve_message_id: u16,
+    sop_class: &'a str,
+    context_id: u8,
+    counts: SubOperationCounts,
+    interval: Option<Duration>,
+    phase: &'static str,
+    sop_instance_uid: Option<&'a str>,
+}
+
 async fn next_move_outcome_or_cancel(
     assoc: &mut Association,
     items: &mut crate::services::provider::StreamingRetrieveItemStream,
-    retrieve_message_id: u16,
+    pending_context: MovePendingResponseContext<'_>,
 ) -> DcmResult<NextMoveOutcome> {
     loop {
         tokio::select! {
@@ -792,7 +897,7 @@ async fn next_move_outcome_or_cancel(
             readiness = assoc.wait_for_incoming_data() => {
                 readiness?;
                 while let Some((context_id, command)) = assoc.try_recv_dimse_command()? {
-                    if is_matching_cancel(&command, retrieve_message_id) {
+                    if is_matching_cancel(&command, pending_context.retrieve_message_id) {
                         return Ok(NextMoveOutcome::Cancelled);
                     }
                     match command.get_u16(tags::COMMAND_FIELD) {
@@ -805,6 +910,21 @@ async fn next_move_outcome_or_cancel(
                         }
                     }
                 }
+            }
+            () = wait_for_pending_heartbeat(pending_context.interval) => {
+                send_pending_response(
+                    assoc,
+                    pending_context.sop_class,
+                    pending_context.context_id,
+                    pending_context.retrieve_message_id,
+                    pending_context.counts,
+                ).await?;
+                log_pending_heartbeat(
+                    assoc,
+                    pending_context.phase,
+                    pending_context.sop_instance_uid,
+                    pending_context.counts,
+                );
             }
         }
     }
@@ -819,7 +939,7 @@ async fn move_store_or_cancel(
     assoc: &mut Association,
     sub_association: &mut Association,
     request: StoreSourceRequest,
-    retrieve_message_id: u16,
+    pending_context: MovePendingResponseContext<'_>,
 ) -> DcmResult<MoveStoreOutcome> {
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     let store = c_store_source_abort_on_cancel(sub_association, request, &cancellation_token);
@@ -838,7 +958,7 @@ async fn move_store_or_cancel(
             readiness = assoc.wait_for_incoming_data() => {
                 readiness?;
                 while let Some((context_id, command)) = assoc.try_recv_dimse_command()? {
-                    if is_matching_cancel(&command, retrieve_message_id) {
+                    if is_matching_cancel(&command, pending_context.retrieve_message_id) {
                         cancellation_token.cancel();
                         let result = store.await;
                         return Ok(match result {
@@ -862,7 +982,130 @@ async fn move_store_or_cancel(
                     }
                 }
             }
+            () = wait_for_pending_heartbeat(pending_context.interval) => {
+                send_pending_response(
+                    assoc,
+                    pending_context.sop_class,
+                    pending_context.context_id,
+                    pending_context.retrieve_message_id,
+                    pending_context.counts,
+                ).await?;
+                log_pending_heartbeat(
+                    assoc,
+                    pending_context.phase,
+                    pending_context.sop_instance_uid,
+                    pending_context.counts,
+                );
+            }
         }
+    }
+}
+
+async fn wait_for_pending_heartbeat(interval: Option<Duration>) {
+    match interval {
+        Some(interval) => tokio::time::sleep(interval).await,
+        None => pending::<()>().await,
+    }
+}
+
+fn sub_operation_counts(
+    total: u16,
+    completed: u16,
+    failed: u16,
+    warning: u16,
+) -> SubOperationCounts {
+    SubOperationCounts {
+        remaining: total.saturating_sub(completed.saturating_add(failed).saturating_add(warning)),
+        completed,
+        failed,
+        warning,
+    }
+}
+
+fn log_pending_heartbeat(
+    association: &Association,
+    phase: &'static str,
+    sop_instance_uid: Option<&str>,
+    counts: SubOperationCounts,
+) {
+    info!(
+        dimse_service = "C-MOVE",
+        calling_ae = %association.calling_ae.trim(),
+        called_ae = %association.called_ae.trim(),
+        phase,
+        sop_instance_uid,
+        remaining_suboperations = counts.remaining,
+        completed_suboperations = counts.completed,
+        failed_suboperations = counts.failed,
+        warning_suboperations = counts.warning,
+        "C-MOVE Pending heartbeat sent"
+    );
+}
+
+fn log_move_progress(
+    total: u16,
+    completed: u16,
+    failed: u16,
+    warning: u16,
+    destination: &str,
+    destination_address: &str,
+) {
+    let accounted = completed.saturating_add(failed).saturating_add(warning);
+    if accounted == 0 || accounted == total || accounted % 100 != 0 {
+        return;
+    }
+    info!(
+        dimse_service = "C-MOVE",
+        destination_ae = %destination,
+        destination_address,
+        total_suboperations = total,
+        remaining_suboperations = total.saturating_sub(accounted),
+        completed_suboperations = completed,
+        failed_suboperations = failed,
+        warning_suboperations = warning,
+        "C-MOVE retrieval progress"
+    );
+}
+
+fn log_request_association_interruption(
+    association: &Association,
+    destination: &str,
+    destination_address: &str,
+    phase: &'static str,
+    sop_instance_uid: Option<&str>,
+    counts: SubOperationCounts,
+    error: &dicom_toolkit_core::error::DcmError,
+) {
+    warn!(
+        dimse_service = "C-MOVE",
+        calling_ae = %association.calling_ae.trim(),
+        called_ae = %association.called_ae.trim(),
+        destination_ae = %destination,
+        destination_address,
+        phase,
+        sop_instance_uid,
+        remaining_suboperations = counts.remaining,
+        completed_suboperations = counts.completed,
+        failed_suboperations = counts.failed,
+        warning_suboperations = counts.warning,
+        %error,
+        "C-MOVE request association interrupted during active retrieval"
+    );
+}
+
+async fn abort_storage_after_request_failure(
+    storage_association: &mut Association,
+    destination: &str,
+    request_error: &dicom_toolkit_core::error::DcmError,
+) {
+    if let Err(storage_abort_error) = storage_association.abort_strict().await {
+        warn!(
+            dimse_service = "C-MOVE",
+            destination_ae = %destination,
+            %request_error,
+            %storage_abort_error,
+            "failed to abort C-MOVE Storage association after request association failure"
+        );
     }
 }
 
